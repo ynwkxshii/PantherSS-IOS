@@ -1017,9 +1017,9 @@ body {
 /* ── HERO ─────────────────────────────────────────────────────────────── */
 .hero {
   position:relative; overflow:hidden;
-  background:linear-gradient(135deg, #000000 0%, #0a0a1f 50%, #000011 100%);
+  background:#000000;
   border-bottom:1px solid var(--border);
-  padding:48px 24px 36px;
+  padding:32px 24px 28px;
   text-align:center;
   backdrop-filter:blur(20px);
 }
@@ -1031,7 +1031,7 @@ body {
   left:50%;
   width:600px;
   height:600px;
-  background:radial-gradient(circle, rgba(0,0,139,0.08) 0%, transparent 70%);
+  background:radial-gradient(circle, rgba(0,0,139,0.06) 0%, transparent 70%);
   transform:translateX(-50%);
   pointer-events:none;
   filter:blur(60px);
@@ -1044,7 +1044,7 @@ body {
   right:-10%;
   width:400px;
   height:400px;
-  background:radial-gradient(circle, rgba(0,102,255,0.04) 0%, transparent 70%);
+  background:radial-gradient(circle, rgba(0,102,255,0.03) 0%, transparent 70%);
   pointer-events:none;
   filter:blur(40px);
 }
@@ -1058,69 +1058,69 @@ body {
 }
 
 .panther-logo {
-  width:100px;
-  height:100px;
-  border-radius:24px;
-  margin:0 auto 20px;
-  border:2px solid rgba(0,0,139,0.4);
-  background:linear-gradient(135deg, rgba(0,0,139,0.2), rgba(0,102,255,0.1));
-  box-shadow:0 8px 32px rgba(0,0,139,0.15), inset 0 0 32px rgba(0,102,255,0.08), 0 0 20px rgba(0,102,255,0.05);
+  width:70px;
+  height:70px;
+  border-radius:18px;
+  margin:0 auto 14px;
+  border:2px solid rgba(0,0,139,0.3);
+  background:#000000;
+  box-shadow:0 4px 16px rgba(0,0,139,0.1), inset 0 0 16px rgba(0,102,255,0.05), 0 0 12px rgba(0,102,255,0.03);
   object-fit:cover;
   display:block;
-  backdrop-filter:blur(10px);
+  backdrop-filter:blur(8px);
   position:relative;
   z-index:10;
 }
 
 .hero-eyebrow {
   font-family:'Syne', sans-serif;
-  font-size:11px;
-  letter-spacing:3px;
-  color:rgba(0,102,255,0.6);
+  font-size:10px;
+  letter-spacing:2px;
+  color:rgba(0,102,255,0.5);
   text-transform:uppercase;
-  margin-bottom:12px;
+  margin-bottom:8px;
   font-weight:600;
 }
 
 .hero-name {
   font-family:'Syne', sans-serif;
-  font-size:56px;
+  font-size:48px;
   font-weight:800;
   letter-spacing:-0.5px;
   color:#fff;
   line-height:1;
-  margin-bottom:4px;
-  text-shadow:0 4px 16px rgba(0,0,139,0.2);
+  margin-bottom:2px;
+  text-shadow:0 2px 8px rgba(0,0,139,0.15);
   position:relative;
   z-index:10;
 }
 
 .hero-name span {
   color:var(--blue-light);
-  text-shadow:0 4px 16px rgba(0,102,255,0.3);
+  text-shadow:0 2px 8px rgba(0,102,255,0.2);
 }
 
 .hero-sub {
   font-family:'Syne', sans-serif;
-  font-size:13px;
-  letter-spacing:2px;
-  color:rgba(224,224,255,0.5);
+  font-size:11px;
+  letter-spacing:1.5px;
+  color:rgba(224,224,255,0.45);
   text-transform:uppercase;
-  margin-bottom:28px;
+  margin-bottom:18px;
   font-weight:600;
 }
 
 .hero-file {
-  font-size:11px;
+  font-size:10px;
   color:var(--text-dim);
   word-break:break-all;
-  padding:12px 16px;
-  background:rgba(0,0,139,0.08);
+  padding:10px 14px;
+  background:rgba(0,0,139,0.06);
   backdrop-filter:blur(10px);
-  border-radius:12px;
+  border-radius:10px;
   border:1px solid var(--border);
-  margin-bottom:20px;
-  line-height:1.6;
+  margin-bottom:14px;
+  line-height:1.5;
   text-align:left;
 }
 
@@ -1131,7 +1131,7 @@ body {
 .hero-grid {
   display:grid;
   grid-template-columns:1fr 1fr;
-  gap:12px;
+  gap:9px;
   position:relative;
   z-index:10;
 }
@@ -1139,8 +1139,8 @@ body {
 .hg-card {
   background:rgba(0,0,139,0.06);
   backdrop-filter:blur(15px);
-  border-radius:14px;
-  padding:14px 16px;
+  border-radius:12px;
+  padding:12px 14px;
   border:1px solid var(--border);
   box-shadow:0 4px 16px rgba(0,0,0,0.3);
   transition:all 0.3s ease;
@@ -1153,17 +1153,17 @@ body {
 }
 
 .hg-label {
-  font-size:10px;
+  font-size:9px;
   color:var(--text-dim);
-  letter-spacing:1px;
+  letter-spacing:0.8px;
   text-transform:uppercase;
-  margin-bottom:6px;
+  margin-bottom:4px;
   font-family:'Syne', sans-serif;
   font-weight:600;
 }
 
 .hg-val {
-  font-size:14px;
+  font-size:13px;
   color:var(--text);
   font-weight:600;
 }
@@ -1171,7 +1171,7 @@ body {
 .hg-val.blue {
   color:var(--blue-light);
   font-weight:700;
-  font-size:18px;
+  font-size:16px;
 }
 
 .hg-val.warn {
