@@ -2617,7 +2617,6 @@ document.addEventListener('DOMContentLoaded',function(){
 </body>
 </html>`
 }
-}
 
 // ─── FILE READING ────────────────────────────────────────────────────────────
 
