@@ -304,6 +304,419 @@ function analyzeTemporalPatterns(netEntries) {
   return { peakMinute, avgPerMinute: Math.round(avgPerMinute), spikes: spikes.length, totalMinutes: minutes.length }
 }
 
+// ─── MÓDULO 1: IP vs LOCALIZAÇÃO ────────────────────────────────────────────
+// Compara a região geográfica dos IPs em networkActivity com coordenadas
+// de entradas category:location no mesmo intervalo de ±5 minutos.
+
+function analyzeIPvsLocation(entries, ipLookupMap) {
+  const WINDOW_MS = 5 * 60 * 1000 // ±5 minutos
+
+  // Coleta entradas de acesso a localização (category: location)
+  let locationAccesses = entries.filter(e =>
+    e.type === "access" &&
+    e.category === "location" &&
+    e.timeStamp
+  ).map(e => ({
+    ts: new Date(e.timeStamp).getTime(),
+    bundleID: e.accessor && e.accessor.identifier ? e.accessor.identifier : (e.bundleID || "?"),
+    timeStamp: e.timeStamp,
+  }))
+
+  if (locationAccesses.length === 0) return []
+
+  // Coleta entradas de rede com IP resolvido
+  let netEntries = entries.filter(e =>
+    e.type === "networkActivity" && e.timeStamp && e.domain
+  )
+
+  let conflicts = []
+
+  for (let locEntry of locationAccesses) {
+    // Busca conexões de rede dentro da janela de ±5min
+    let nearbyNet = netEntries.filter(e => {
+      let diff = Math.abs(new Date(e.timeStamp).getTime() - locEntry.ts)
+      return diff <= WINDOW_MS
+    })
+
+    for (let netEntry of nearbyNet) {
+      let domain = netEntry.domain || ""
+      let ipInfo = ipLookupMap && ipLookupMap[domain]
+      if (!ipInfo || ipInfo.status !== "success") continue
+
+      // País/região do IP resolvido
+      let ipCountry  = (ipInfo.country || "").trim()
+      let ipCity     = (ipInfo.city    || "").trim()
+      let ipLat      = ipInfo.lat  || null
+      let ipLon      = ipInfo.lon  || null
+
+      // Sinaliza quando o IP é de datacenter/hosting ativo durante acesso a localização
+      let isHosting = ipInfo.hosting || ipInfo.proxy
+      let asnKey    = ((ipInfo.as || "").split(" ")[0] || "").toUpperCase()
+      let isCheatASN = !!CHEAT_PROXY_ASN[asnKey]
+
+      if (!isHosting && !isCheatASN) continue
+
+      // Evita duplicatas por (bundleID + domínio)
+      let key = `${locEntry.bundleID}||${domain}`
+      if (conflicts.some(c => c._key === key)) continue
+
+      conflicts.push({
+        _key:          key,
+        bundleID:      locEntry.bundleID,
+        locationTs:    locEntry.timeStamp,
+        networkTs:     netEntry.timeStamp,
+        domain,
+        ipCountry,
+        ipCity,
+        ipLat,
+        ipLon,
+        isp:           ipInfo.isp   || "?",
+        asn:           ipInfo.as    || "?",
+        isHosting,
+        isCheatASN,
+        asnLabel:      CHEAT_PROXY_ASN[asnKey] || null,
+        hits:          netEntry.hits || 1,
+        diffMinutes:   Math.round(Math.abs(new Date(netEntry.timeStamp).getTime() - locEntry.ts) / 60000),
+      })
+    }
+  }
+
+  // Ordena por severidade: ASN de cheat primeiro, depois hosting
+  conflicts.sort((a, b) => {
+    if (a.isCheatASN !== b.isCheatASN) return a.isCheatASN ? -1 : 1
+    return b.hits - a.hits
+  })
+
+  return conflicts
+}
+
+// ─── MÓDULO 2: SHORTCUTS SUSPEITOS ──────────────────────────────────────────
+// Filtra com.apple.ShortcutsActions e sinaliza se intervalBegin coincidir
+// com pico de tráfego de rede de um jogo-alvo (Free Fire / PUBG etc.)
+
+const TARGET_GAME_BUNDLES = new Set([
+  "com.dts.freefireth",
+  "com.dts.freefiremax",
+  "com.tencent.ig",           // PUBG Mobile
+  "com.tencent.bgrealm",
+  "com.activision.callofduty",
+  "com.ea.ios.bfmobile",
+])
+
+function analyzeShortcuts(entries, temporalPeaks) {
+  const SHORTCUTS_BUNDLE = "com.apple.ShortcutsActions"
+  const WINDOW_MS = 5 * 60 * 1000
+
+  // Coleta acessos do ShortcutsActions
+  let shortcutEntries = entries.filter(e =>
+    (e.bundleID === SHORTCUTS_BUNDLE ||
+     (e.accessor && e.accessor.identifier === SHORTCUTS_BUNDLE)) &&
+    (e.timeStamp || e.intervalBegin)
+  )
+
+  if (shortcutEntries.length === 0) return []
+
+  // Monta um mapa de timestamps de tráfego dos jogos-alvo para detectar picos
+  let gameTrafficWindows = []
+  for (let e of entries) {
+    if (e.type !== "networkActivity") continue
+    if (!TARGET_GAME_BUNDLES.has(e.bundleID)) continue
+    if (!e.timeStamp) continue
+    gameTrafficWindows.push({
+      ts:  new Date(e.timeStamp).getTime(),
+      bid: e.bundleID,
+      hits: e.hits || 1,
+    })
+  }
+
+  // Usa picos detectados em analyzeTemporalPatterns se disponíveis
+  let peakTs = (temporalPeaks || []).map(([label]) => {
+    // label é "YYYY-M-D H:MM" — converte de volta
+    let parts = label.match(/(\d+)-(\d+)-(\d+) (\d+):(\d+)/)
+    if (!parts) return null
+    return new Date(
+      parseInt(parts[1]), parseInt(parts[2]), parseInt(parts[3]),
+      parseInt(parts[4]), parseInt(parts[5])
+    ).getTime()
+  }).filter(Boolean)
+
+  let alerts = []
+
+  for (let sc of shortcutEntries) {
+    let scTs = new Date(sc.intervalBegin || sc.timeStamp).getTime()
+    if (isNaN(scTs)) continue
+
+    // Verifica sobreposição com tráfego do jogo-alvo
+    let matchingGame = gameTrafficWindows.find(g =>
+      Math.abs(g.ts - scTs) <= WINDOW_MS
+    )
+
+    // Verifica sobreposição com pico global detectado
+    let matchingPeak = peakTs.find(p => Math.abs(p - scTs) <= WINDOW_MS)
+
+    if (!matchingGame && !matchingPeak) continue
+
+    alerts.push({
+      bundleID:    sc.bundleID || SHORTCUTS_BUNDLE,
+      intervalBegin: sc.intervalBegin || sc.timeStamp,
+      category:    sc.category || "?",
+      matchedGame: matchingGame ? matchingGame.bid : null,
+      matchedPeak: !!matchingPeak,
+      diffMinutes: matchingGame
+        ? Math.round(Math.abs(matchingGame.ts - scTs) / 60000)
+        : matchingPeak
+          ? Math.round(Math.abs(matchingPeak - scTs) / 60000)
+          : null,
+    })
+  }
+
+  return alerts
+}
+
+// ─── MÓDULO 3: SIDE-LOADING ──────────────────────────────────────────────────
+// Detecta domínios de telemetria (sentry.io, appsflyer.com) em apps sem domínio
+// oficial da App Store. Verifica indicadores de sideload: ppsspp.org, altstore.io.
+
+const TELEMETRY_DOMAINS = [
+  "sentry.io", "ingest.sentry.io",
+  "appsflyer.com", "t.appsflyer.com", "api2.appsflyer.com",
+  "amplitude.com", "api.amplitude.com",
+  "mixpanel.com", "api.mixpanel.com",
+  "segment.io", "api.segment.io",
+  "firebase.io", "firebaseio.com",
+  "bugsnag.com", "notify.bugsnag.com",
+  "crashlytics.com",
+  "adjust.com", "app.adjust.com",
+  "branch.io", "api2.branch.io",
+]
+
+const SIDELOAD_INDICATOR_DOMAINS = [
+  "ppsspp.org", "www.ppsspp.org",
+  "altstore.io", "api.altstore.io",
+  "sideloadly.io",
+  "ipa.store",
+  "signulous.com",
+  "esign.yyyue.xyz",
+  "udid.io",
+  "diawi.com",
+  "testflight.apple.com",  // legítimo mas monitorar contexto
+]
+
+// Domínios oficiais de apps que normalmente estão na App Store
+const APP_STORE_OFFICIAL_DOMAINS = new Set([
+  "apple.com", "icloud.com", "mzstatic.com", "phobos.apple.com",
+  "apps.apple.com", "itunes.apple.com",
+])
+
+function analyzeSideloading(entries) {
+  let netEntries = entries.filter(e => e.type === "networkActivity" && e.domain && e.bundleID)
+
+  // Agrupa domínios por bundleID
+  let byBundle = {}
+  for (let e of netEntries) {
+    let bid = e.bundleID
+    if (!byBundle[bid]) byBundle[bid] = { domains: new Set(), hits: 0 }
+    byBundle[bid].domains.add((e.domain || "").toLowerCase())
+    byBundle[bid].hits += (e.hits || 1)
+  }
+
+  let findings = []
+
+  for (let [bundleID, info] of Object.entries(byBundle)) {
+    let domains = [...info.domains]
+
+    // Detecta domínios de telemetria presentes
+    let telemetryHits = TELEMETRY_DOMAINS.filter(td =>
+      domains.some(d => d === td || d.endsWith("." + td))
+    )
+
+    // Detecta indicadores de sideload
+    let sideloadHits = SIDELOAD_INDICATOR_DOMAINS.filter(sd =>
+      domains.some(d => d === sd || d.endsWith("." + sd))
+    )
+
+    if (telemetryHits.length === 0 && sideloadHits.length === 0) continue
+
+    // Verifica se o app tem domínio oficial da App Store
+    let hasOfficialDomain = domains.some(d =>
+      [...APP_STORE_OFFICIAL_DOMAINS].some(od => d.endsWith(od))
+    )
+
+    // Sideload suspeito: app com telemetria mas SEM domínio oficial OU com indicadores diretos
+    let isSideloadSuspect = sideloadHits.length > 0 || !hasOfficialDomain
+
+    // Só reporta se há alguma suspeita
+    if (!isSideloadSuspect && telemetryHits.length === 0) continue
+
+    // Determina severidade
+    let severity = sideloadHits.length > 0 ? "CRITICAL" :
+                   (!hasOfficialDomain && telemetryHits.length > 0) ? "HIGH" : "MEDIUM"
+
+    findings.push({
+      bundleID,
+      telemetryDomains: telemetryHits,
+      sideloadDomains:  sideloadHits,
+      hasOfficialDomain,
+      totalDomains:     domains.length,
+      hits:             info.hits,
+      severity,
+    })
+  }
+
+  // Ordena: CRITICAL > HIGH > MEDIUM, depois por hits
+  const sevOrder = { CRITICAL: 0, HIGH: 1, MEDIUM: 2 }
+  findings.sort((a, b) =>
+    sevOrder[a.severity] - sevOrder[b.severity] || b.hits - a.hits
+  )
+
+  return findings
+}
+
+// ─── MÓDULO 4: URLs DE SCRIPT ────────────────────────────────────────────────
+// Regex em domain para raw.githubusercontent.com, gist.github, pastebin, CDNs.
+// Se dk.simonbs.Scriptable acessar esses domínios → alerta Risco Crítico.
+
+const SCRIPT_URL_PATTERNS = [
+  { regex: /raw\.githubusercontent\.com/i,  label: "GitHub Raw (execução direta de código)" },
+  { regex: /gist\.github(usercontent)?\.com/i, label: "GitHub Gist (script público)" },
+  { regex: /pastebin\.com/i,                label: "Pastebin (código não auditado)" },
+  { regex: /pastecode\.io/i,                label: "PasteCode (código não auditado)" },
+  { regex: /hastebin\.com/i,                label: "Hastebin (código não auditado)" },
+  { regex: /cdn\.jsdelivr\.net/i,           label: "jsDelivr CDN (entrega de scripts)" },
+  { regex: /unpkg\.com/i,                   label: "UNPKG CDN (entrega de scripts)" },
+  { regex: /cdnjs\.cloudflare\.com/i,       label: "CDNJS/Cloudflare CDN" },
+  { regex: /rawgit\.com/i,                  label: "RawGit (GitHub raw deprecated)" },
+  { regex: /script\.google\.com/i,          label: "Google Apps Script" },
+  { regex: /glitch\.me/i,                   label: "Glitch.me (hosting de scripts)" },
+  { regex: /replit\.com/i,                  label: "Replit (execução remota)" },
+  { regex: /\.workers\.dev/i,               label: "Cloudflare Workers (execução serverless)" },
+  { regex: /\.vercel\.app/i,                label: "Vercel (deploy dinâmico)" },
+  { regex: /\.netlify\.app/i,               label: "Netlify (deploy dinâmico)" },
+]
+
+const SCRIPTABLE_BUNDLE = "dk.simonbs.Scriptable"
+
+function analyzeScriptURLs(entries) {
+  let netEntries = entries.filter(e => e.type === "networkActivity" && e.domain && e.bundleID)
+
+  let findings = []
+
+  for (let e of netEntries) {
+    let domain = (e.domain || "").toLowerCase()
+    let bundleID = e.bundleID || ""
+
+    for (let pattern of SCRIPT_URL_PATTERNS) {
+      if (!pattern.regex.test(domain)) continue
+
+      let isScriptable = bundleID === SCRIPTABLE_BUNDLE
+      let severity = isScriptable ? "CRITICAL" : "HIGH"
+
+      // Evita duplicatas por (bundleID + domínio + padrão)
+      let key = `${bundleID}||${domain}||${pattern.label}`
+      if (findings.some(f => f._key === key)) continue
+
+      findings.push({
+        _key:       key,
+        bundleID,
+        domain:     e.domain,
+        pattern:    pattern.label,
+        isScriptable,
+        severity,
+        hits:       e.hits || 1,
+        timeStamp:  e.timeStamp || null,
+      })
+      break
+    }
+  }
+
+  // Agrega por bundleID + domínio, somando hits
+  let aggregated = {}
+  for (let f of findings) {
+    let k = `${f.bundleID}||${f.domain}`
+    if (!aggregated[k]) {
+      aggregated[k] = { ...f, hits: 0 }
+      delete aggregated[k]._key
+    }
+    // Reinsere com hits acumulados
+    if (!aggregated[f._key]) aggregated[f._key] = { ...f }
+    else aggregated[f._key].hits += f.hits
+  }
+
+  let result = Object.values(aggregated)
+  // Ordena: Scriptable CRITICAL primeiro, depois HIGH, depois hits
+  result.sort((a, b) => {
+    if (a.isScriptable !== b.isScriptable) return a.isScriptable ? -1 : 1
+    if (a.severity !== b.severity) return a.severity === "CRITICAL" ? -1 : 1
+    return b.hits - a.hits
+  })
+
+  return result
+}
+
+// ─── MÓDULO 5: GHOST ACTIVITY (avançado) ─────────────────────────────────────
+// Lista bundleIDs com atividade de rede/sensores ausentes de um array
+// installedApps fornecido pelo analista. Complementa a detecção anterior.
+
+function analyzeGhostActivity(entries, installedApps) {
+  // installedApps: array de strings com bundleIDs conhecidos do dispositivo
+  if (!installedApps || installedApps.length === 0) return { ghosts: [], orphans: [] }
+
+  let knownApps = new Set(installedApps.map(b => (b || "").trim()).filter(Boolean))
+
+  // Coleta todos bundleIDs com atividade no relatório
+  let activeInReport = new Set()
+  for (let e of entries) {
+    let bid = e.bundleID || (e.accessor && e.accessor.identifier) || null
+    if (bid) activeInReport.add(bid)
+  }
+
+  // GHOST: bundleID ativo no relatório mas AUSENTE de installedApps
+  // (app operando sem estar instalado visivelmente → possível app fantasma/injetado)
+  let ghosts = [...activeInReport].filter(bid => {
+    if (knownApps.has(bid)) return false
+    // Exclui identificadores do sistema Apple
+    if (bid.startsWith("com.apple.") && !CHEAT_APPS[bid]) return false
+    return true
+  }).map(bid => {
+    let netE = entries.filter(e =>
+      e.type === "networkActivity" && e.bundleID === bid
+    )
+    let accE = entries.filter(e =>
+      e.type === "access" && (e.bundleID === bid || (e.accessor && e.accessor.identifier === bid))
+    )
+    let domains = [...new Set(netE.map(e => e.domain).filter(Boolean))]
+    let categories = [...new Set(accE.map(e => e.category).filter(Boolean))]
+    let hits = netE.reduce((s, e) => s + (e.hits || 1), 0)
+    let isKnownCheat = !!CHEAT_APPS[bid]
+    return {
+      bundleID:   bid,
+      domains:    domains.slice(0, 10),
+      categories,
+      netEvents:  netE.length,
+      accEvents:  accE.length,
+      hits,
+      isKnownCheat,
+      severity:   isKnownCheat ? "CRITICAL" : hits > 50 ? "HIGH" : "MEDIUM",
+    }
+  })
+
+  // ORPHAN: bundleID em installedApps com ZERO atividade no relatório
+  // (app instalado que não aparece → pode ter limpado rastros)
+  let orphans = [...knownApps].filter(bid => !activeInReport.has(bid))
+    .map(bid => ({
+      bundleID: bid,
+      isKnownCheat: !!CHEAT_APPS[bid],
+    }))
+
+  // Ordena ghosts por severidade
+  const sevOrder = { CRITICAL: 0, HIGH: 1, MEDIUM: 2 }
+  ghosts.sort((a, b) =>
+    sevOrder[a.severity] - sevOrder[b.severity] || b.hits - a.hits
+  )
+
+  return { ghosts, orphans }
+}
+
 // ─── NOVO: DETECÇÃO DE APPS GHOST (acessando domínios suspeitos sem aparecer no usage) ──
 
 // ─── PARSE / VALIDAÇÃO ──────────────────────────────────────────────────────
@@ -509,7 +922,7 @@ function wait(ms) { return new Promise(resolve => Timer.schedule(ms, false, reso
 
 // ─── ANÁLISE PRINCIPAL ──────────────────────────────────────────────────────
 
-async function analyze(entries) {
+async function analyze(entries, installedApps) {
   let netEntries = entries.filter(e => e.type === "networkActivity")
   let domainHits = {}, domainBundles = {}
   for (let e of netEntries) {
@@ -682,7 +1095,7 @@ async function analyze(entries) {
     return b.hits - a.hits
   })
 
-  // Ghost app findings
+  // Ghost app findings (legado — domínios suspeitos conhecidos)
   const GHOST_SUSPECT_DOMAINS = new Set(Object.keys(KNOWN_CHEAT_INFRA))
   let suspectByBundle = {}
   for (let e of netEntries) {
@@ -701,12 +1114,82 @@ async function analyze(entries) {
     bundleID: bid, domains: [...new Set(info.domains)], hits: info.hits
   }))
 
-  return { findings, netEntries, cheatAppFindings, knownCheatFindings, ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains }
+  // ── MÓDULO 1: IP vs Localização ─────────────────────────────────────────
+  // Monta mapa domain→ipInfo a partir dos resultados do batch lookup
+  let ipLookupMap = {}
+  // O candidates array já contém ip + info resolvida; reaproveitamos após probe
+  // (preenchido abaixo após o loop de lookup — ver ipLookupMapRaw)
+  let ipVsLocationFindings = []
+  try {
+    // Reconstrói o mapa domain→info a partir dos dados já processados em candidates
+    let ipInfoMap = {}
+    for (let c of candidates) {
+      ipInfoMap[c.domain] = {
+        status: "success",
+        country: c.country, city: c.city,
+        isp: c.isp, org: c.org, as: c.as,
+        hosting: c.hosting, proxy: c.proxy,
+        reverse: c.reverse,
+      }
+    }
+    ipVsLocationFindings = analyzeIPvsLocation(entries, ipInfoMap)
+  } catch(e) { console.log("Módulo 1 erro: " + e) }
+
+  // ── MÓDULO 2: Shortcuts Suspeitos ────────────────────────────────────────
+  let shortcutFindings = []
+  try {
+    let { spikes: _sp, ...tempRaw } = temporalAnalysis
+    // Extrai os picos brutos do byMinute para passar ao módulo
+    let byMinuteEntries = []
+    let _bm = {}
+    for (let e of netEntries) {
+      if (!e.timeStamp) continue
+      let d = new Date(e.timeStamp)
+      let key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`
+      _bm[key] = (_bm[key] || 0) + (e.hits || 1)
+    }
+    let avgAll = Object.values(_bm).length
+      ? Object.values(_bm).reduce((s,v) => s+v, 0) / Object.values(_bm).length
+      : 0
+    byMinuteEntries = Object.entries(_bm).filter(([,v]) => v > avgAll * 3)
+    shortcutFindings = analyzeShortcuts(entries, byMinuteEntries)
+  } catch(e) { console.log("Módulo 2 erro: " + e) }
+
+  // ── MÓDULO 3: Side-Loading ───────────────────────────────────────────────
+  let sideloadFindings = []
+  try {
+    sideloadFindings = analyzeSideloading(entries)
+  } catch(e) { console.log("Módulo 3 erro: " + e) }
+
+  // ── MÓDULO 4: URLs de Script ─────────────────────────────────────────────
+  let scriptURLFindings = []
+  try {
+    scriptURLFindings = analyzeScriptURLs(entries)
+  } catch(e) { console.log("Módulo 4 erro: " + e) }
+
+  // ── MÓDULO 5: Ghost Activity (com installedApps) ─────────────────────────
+  let ghostActivityResult = { ghosts: [], orphans: [] }
+  try {
+    ghostActivityResult = analyzeGhostActivity(entries, installedApps || [])
+  } catch(e) { console.log("Módulo 5 erro: " + e) }
+
+  return {
+    findings, netEntries, cheatAppFindings, knownCheatFindings,
+    ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains,
+    // Módulos avançados
+    ipVsLocationFindings, shortcutFindings, sideloadFindings,
+    scriptURLFindings, ghostActivityResult,
+  }
 }
 
 // ─── HTML BUILDER ────────────────────────────────────────────────────────────
 
-function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, ipsFindings, ipsMeta, ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains, filename) {
+function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, ipsFindings, ipsMeta, ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains, filename, advModules) {
+  let ipVsLocationFindings = (advModules && advModules.ipVsLocationFindings) || []
+  let shortcutFindings     = (advModules && advModules.shortcutFindings)     || []
+  let sideloadFindings     = (advModules && advModules.sideloadFindings)     || []
+  let scriptURLFindings    = (advModules && advModules.scriptURLFindings)    || []
+  let ghostActivityResult  = (advModules && advModules.ghostActivityResult)  || { ghosts: [], orphans: [] }
   let allTimestamps = netEntries.map(e => e.timeStamp).filter(Boolean).sort()
   let firstTs = allTimestamps.length ? new Date(allTimestamps[0]) : null
   let lastTs  = allTimestamps.length ? new Date(allTimestamps[allTimestamps.length-1]) : null
@@ -777,25 +1260,25 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
   // ── CARDS CRÍTICOS ──────────────────────────────────────────────────────
   let criticalCards = ""
   for (let p of proxyLoginFindings) {
-    let bundleList = p.bundles.map(b => `<span class="bundle" style="color:#ff6600">${b}</span>`).join(" ")
-    criticalCards += `<div class="card critical" style="border-left-color:#ff4400;">
-      <div class="card-header"><span class="badge critical">🔒 PROXY BYPASS LOGIN — CRÍTICO</span><span class="conns">${p.hits} conexões</span></div>
+    let bundleList = p.bundles.map(b => `<span class="bundle-chip" style="color:#ff8800">${b}</span>`).join(" ")
+    criticalCards += `<div class="card critical">
+      <div class="card-head"><span class="badge critical">🔒 PROXY BYPASS LOGIN — CRÍTICO</span><span class="conns">${p.hits} conexões</span></div>
       <div class="card-domain">${p.domain}</div>
-      <div class="grid">
-        <div class="row"><span class="label">Detecção</span><span class="val reason" style="color:#ff8800;font-weight:bold">Domínio exclusivo do Free Fire chamado por app não autorizado — proxy interceptando login</span></div>
-        <div class="row"><span class="label">App interceptor</span><span class="val">${bundleList}</span></div>
-        <div class="row"><span class="label">Esperado de</span><span class="val"><span class="bundle" style="color:#44ff88">com.dts.freefireth</span> <span class="bundle" style="color:#44ff88">com.dts.freefiremax</span></span></div>
+      <div class="cgrid">
+        <div class="crow"><span class="clabel">Detecção</span><span class="cval reason">Domínio exclusivo do Free Fire chamado por app não autorizado — proxy interceptando login</span></div>
+        <div class="crow"><span class="clabel">Interceptor</span><span class="cval">${bundleList}</span></div>
+        <div class="crow"><span class="clabel">Esperado de</span><span class="cval"><span class="bundle-chip" style="color:#00e5a0">com.dts.freefireth</span> <span class="bundle-chip" style="color:#00e5a0">com.dts.freefiremax</span></span></div>
       </div></div>`
   }
   for (let k of knownCheatFindings) {
-    let bundleList = k.bundles.map(b => `<span class="bundle">${b}</span>`).join(" ")
+    let bundleList = k.bundles.map(b => `<span class="bundle-chip">${b}</span>`).join(" ")
     criticalCards += `<div class="card critical">
-      <div class="card-header"><span class="badge critical" data-badge-type="known-cheat">⚠ CRÍTICO — CHEAT CONFIRMADO</span><span class="conns">${k.hits} conexões</span></div>
+      <div class="card-head"><span class="badge critical" data-badge-type="known-cheat">⚠ CRÍTICO — CHEAT CONFIRMADO</span><span class="conns">${k.hits} conexões</span></div>
       <div class="card-domain">${k.indicator}</div>
-      <div class="grid">
-        <div class="row"><span class="label">Cheat</span><span class="val reason" style="color:#ff4444;font-weight:bold">${k.desc}</span></div>
-        <div class="row"><span class="label">Indicador</span><span class="val">${k.indicator.includes(".")&&!k.indicator.match(/^\d+/)?"Domínio":"IP"} detectado no relatório de rede</span></div>
-        ${bundleList?`<div class="row"><span class="label">Usado por</span><span class="val">${bundleList}</span></div>`:""}
+      <div class="cgrid">
+        <div class="crow"><span class="clabel">Cheat</span><span class="cval reason">${k.desc}</span></div>
+        <div class="crow"><span class="clabel">Indicador</span><span class="cval">${k.indicator.includes(".")&&!k.indicator.match(/^\d+/)?"Domínio":"IP"} detectado no relatório de rede</span></div>
+        ${bundleList?`<div class="crow"><span class="clabel">Usado por</span><span class="cval">${bundleList}</span></div>`:""}
       </div></div>`
   }
   for (let f of cheatAppFindings) {
@@ -804,15 +1287,15 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
     let suspectRows = suspectDomains.map(d => {
       let match = findings.find(f2 => f2.domain === d)
       let info = match ? ` — ${match.isp} (${match.country})` : ""
-      return `<div class="domain-row"><span class="domain-badge ${match?match.severity.toLowerCase():""}" data-sev="${match?match.severity:""}">${match?(match.severity==="HIGH"?"SUSPEITO":"POSSÍVEL"):""}</span> ${d}${info}</div>`
+      return `<div class="domain-row"><span class="dbadge ${match?match.severity.toLowerCase():""}" data-sev="${match?match.severity:""}">${match?(match.severity==="HIGH"?"SUSPEITO":"POSSÍVEL"):""}</span>${d}${info}</div>`
     }).join("")
     criticalCards += `<div class="card critical">
-      <div class="card-header"><span class="badge critical">⚠ CRÍTICO — APP PROXY/CHEAT</span><span class="conns">${f.hits} conexões</span></div>
+      <div class="card-head"><span class="badge critical">⚠ CRÍTICO — APP PROXY/CHEAT</span><span class="conns">${f.hits} conexões</span></div>
       <div class="card-domain">${f.bundleID}</div>
-      <div class="grid">
-        <div class="row"><span class="label">App</span><span class="val reason">${f.desc}</span></div>
-        <div class="row"><span class="label">IPs suspeitos<br><span class="sub">${suspectDomains.length} de ${f.domains.length} domínios</span></span>
-          <span class="val">${suspectRows||'<span class="none">Nenhum IP suspeito detectado</span>'}</span></div>
+      <div class="cgrid">
+        <div class="crow"><span class="clabel">App</span><span class="cval reason">${f.desc}</span></div>
+        <div class="crow"><span class="clabel">IPs suspeitos<br><span style="font-size:8px;color:#334">${suspectDomains.length}/${f.domains.length} dom.</span></span>
+          <span class="cval">${suspectRows||'<span class="none">Nenhum IP suspeito detectado</span>'}</span></div>
       </div></div>`
   }
 
@@ -820,57 +1303,66 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
   let ghostSection = ""
   if (ghostAppFindings && ghostAppFindings.length > 0) {
     let ghostRows = ghostAppFindings.map(g => {
-      let domList = g.domains.slice(0,5).map(d => `<span class="ghost-domain">${d}</span>`).join("")
+      let domList = g.domains.slice(0,5).map(d => `<span class="ghost-dom-chip">${d}</span>`).join("")
       let more = g.domains.length > 5 ? `<span class="ghost-more">+${g.domains.length-5} mais</span>` : ""
       return `<div class="ghost-row">
-        <div class="ghost-row-left"><span class="ghost-bundle">${g.bundleID}</span><div class="ghost-domains">${domList}${more}</div></div>
-        <div class="ghost-row-right"><span class="ghost-hits">${g.hits} hits</span><span class="ghost-label">⚠ Domínios suspeitos</span></div></div>`
+        <div style="flex:1;min-width:0"><div class="ghost-bundle">${g.bundleID}</div><div class="ghost-domains">${domList}${more}</div></div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex-shrink:0">
+          <span class="ghost-hits">${g.hits}</span>
+          <span class="ghost-warn">⚠ domínios suspeitos</span>
+        </div></div>`
     }).join("")
-    ghostSection = `<div class="ghost-banner">
-      <div class="ghost-header"><span class="ghost-icon">👻</span>
-        <div class="ghost-title-block"><div class="ghost-title">Apps com domínios suspeitos</div><div class="ghost-sub">Presente no relatório de rede com conexões a infra suspeita</div></div>
-        <span class="ghost-count">${ghostAppFindings.length}</span></div>
+    ghostSection = `<div class="ghost-panel">
+      <div class="ghost-panel-head"><span style="font-size:20px">👻</span>
+        <span class="ghost-ptitle">Apps com domínios suspeitos</span>
+        <span class="ghost-pc">${ghostAppFindings.length}</span></div>
       <div class="ghost-rows">${ghostRows}</div>
-      <div class="ghost-hint">⚠ Verifique se esses apps são legítimos e se foram instalados corretamente</div></div>`
+      <div class="ghost-hint">⚠ Verifique se esses apps são legítimos e se foram instalados corretamente pela App Store</div>
+    </div>`
   }
 
   // ── IPS SECTION ─────────────────────────────────────────────────────────
   let ipsSection = ""
   if (ipsFindings && ipsFindings.length > 0) {
     let ipsRows = ipsFindings.map(f => `<div class="ips-row ips-row-${f.category||'warning'}">
-      <div class="ips-row-left">
-        <div class="ips-row-top"><span class="ips-cat-badge ips-cat-${f.category||'warning'}">${f.category==='critical'?'🚨 CRÍTICO':f.category==='vpn'?'🔒 VPN/PROXY':f.category==='developer'?'🛠 DEVELOPER':'⚠ SUSPEITO'}</span></div>
-        <span class="ips-bundle">${f.bundleId}</span>
-        <span class="ips-reason">${f.reason}</span>
+      <div style="flex:1;min-width:0">
+        <div><span class="ips-cat ips-cat-${f.category||'warning'}">${f.category==='critical'?'🚨 CRÍTICO':f.category==='vpn'?'🔒 VPN/PROXY':f.category==='developer'?'🛠 DEVELOPER':'⚠ SUSPEITO'}</span></div>
+        <div class="ips-bid">${f.bundleId}</div>
+        <div class="ips-reason">${f.reason}</div>
       </div>
-      <div class="ips-row-right">
-        <span class="ips-version">v${f.version}</span>
-        <span class="ips-badge ${f.eventType==='launches'?'launched':'installed'}">${f.eventType==='launches'?'▶ Aberto':'⬇ Instalado'}</span>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0">
+        <span class="ips-ver">v${f.version}</span>
+        <span class="ips-evt ${f.eventType==='launches'?'launched':'installed'}">${f.eventType==='launches'?'▶ Aberto':'⬇ Instalado'}</span>
       </div></div>`).join("")
-    ipsSection = `<div class="ips-banner">
-      <div class="ips-header"><span class="ips-icon">📲</span>
-        <div class="ips-header-text"><div class="ips-title">Apps Suspeitos Instalados</div><div class="ips-sub">Detectados no histórico de uso do dispositivo</div></div>
-        <span class="ips-count">${ipsFindings.length}</span></div>
+    ipsSection = `<div class="ips-panel">
+      <div class="ips-panel-head"><span style="font-size:20px">📲</span>
+        <span class="ips-ptitle">Apps Suspeitos Instalados</span>
+        <span class="ips-pc">${ipsFindings.length}</span></div>
       <div class="ips-rows">${ipsRows}</div>
-      <div class="ips-hint">⚠ Apps encontrados nos dados de análise do iPhone — indicam presença de ferramentas de cheat/jailbreak/proxy</div></div>`
+      <div class="ips-hint">⚠ Apps encontrados nos dados de análise do iPhone — indicam presença de ferramentas de cheat/jailbreak/proxy</div>
+    </div>`
   }
 
   // ── ROOTS WARNING ────────────────────────────────────────────────────────
   let rootsWarn = ""
   if (ipsMeta && ipsMeta.rootsInstalled > 0) {
-    rootsWarn = `<div class="roots-banner">
-      <div class="roots-icon">🔐</div>
-      <div><div class="roots-label">Certificado Raiz Suspeito</div>
-        <div class="roots-detail">${ipsMeta.rootsInstalled} certificado${ipsMeta.rootsInstalled>1?"s":""} raiz instalado${ipsMeta.rootsInstalled>1?"s":""}</div>
-        <div class="roots-hint">Certificados raiz permitem interceptar tráfego HTTPS — padrão de proxy cheat tipo mitmproxy</div></div></div>`
+    rootsWarn = `<div class="alert-banner alert-roots">
+      <div class="alert-icon">🔐</div>
+      <div class="alert-body">
+        <div class="alert-label">Certificado Raiz Suspeito</div>
+        <div class="alert-value">${ipsMeta.rootsInstalled} certificado${ipsMeta.rootsInstalled>1?"s":""} raiz instalado${ipsMeta.rootsInstalled>1?"s":""}</div>
+        <div class="alert-hint">Certificados raiz permitem interceptar tráfego HTTPS — padrão de proxy cheat tipo mitmproxy</div>
+      </div></div>`
   }
 
   // ── STALE BANNER ─────────────────────────────────────────────────────────
-  let staleBanner = staleWarning ? `<div class="stale-banner">
-    <div class="stale-left">🕑</div>
-    <div><div class="stale-label">Arquivo possivelmente antigo</div>
-      <div class="stale-time">Último registro: <strong>${staleStr}</strong></div>
-      <div class="stale-hint">Suspeita: arquivo gerado fora do período da partida para esconder atividade.</div></div></div>` : ""
+  let staleBanner = staleWarning ? `<div class="alert-banner alert-stale">
+    <div class="alert-icon">🕑</div>
+    <div class="alert-body">
+      <div class="alert-label">Arquivo possivelmente antigo</div>
+      <div class="alert-value">Último registro: ${staleStr}</div>
+      <div class="alert-hint stale-hint">Suspeita: arquivo gerado fora do período da partida para esconder atividade.</div>
+    </div></div>` : ""
 
   // ── FF BANNER ─────────────────────────────────────────────────────────
   function loginColor(type) {
@@ -878,830 +1370,1253 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
     if (type.includes("Twitter")||type.includes("X")) return "#1da1f2"
     if (type.includes("Gmail")) return "#ea4335"
     if (type.includes("VK")) return "#4a76a8"
-    return "#556"
+    return "#445577"
   }
-  let ffSessionRows = ffSessions.map((s,i) => {
+  let ffSessionRowsHtml = ffSessions.map((s,i) => {
     let col = loginColor(s.loginType)
     let label = i===0?"Última abertura":i===1?"2ª abertura":"3ª abertura"
     return `<div class="ff-session-row">
-      <div class="ff-session-left"><span class="ff-session-num">${label}</span><span class="ff-session-ts">${s.ts}</span></div>
-      <span class="ff-login-badge" style="background:${col}22;color:${col};border:1px solid ${col}44">${s.loginType}</span></div>`
+      <div style="display:flex;flex-direction:column;gap:1px">
+        <span class="ff-snum">${label}</span>
+        <span class="ff-sts">${s.ts}</span>
+      </div>
+      <span class="ff-login-badge" style="background:${col}1a;color:${col};border:1px solid ${col}44">${s.loginType}</span>
+    </div>`
   }).join("")
-  let ffBanner = ffStr ? `<div class="ff-banner">
-    <div class="ff-left">🔥</div>
-    <div class="ff-info"><div class="ff-label">${ffVersion||"Free Fire"} — Sessões no período</div>
-      ${ffSessionRows}
-      <div class="ff-sessions">${ffAll.length} inicializações registradas no período</div>
-      <div class="ff-hint">Se a última abertura foi após a partida → aplique o W.O!</div></div></div>` : ""
+  let ffBanner = ffStr ? `<div class="alert-banner alert-ff">
+    <div class="alert-icon">🔥</div>
+    <div class="alert-body">
+      <div class="alert-label ff-label">${ffVersion||"Free Fire"} — Sessões no período</div>
+      <div class="ff-session-block">${ffSessionRowsHtml}</div>
+      <div class="alert-sub ff-count-label" style="margin-top:6px">${ffAll.length} inicializações registradas no período</div>
+      <div class="alert-hint ff-hint">Se a última abertura foi após a partida → aplique o W.O!</div>
+    </div></div>` : ""
 
-  let appStoreBanner = appStoreLastTs ? `<div class="appstore-banner">
-    <div class="appstore-left">🛒</div>
-    <div><div class="appstore-label">App Store aberta</div>
-      <div class="appstore-time">${fmtDt(appStoreLastTs)}</div>
-      <div class="appstore-hint">Se foi após a partida → aplique o W.O!</div></div></div>` : ""
+  let appStoreBanner = appStoreLastTs ? `<div class="alert-banner alert-store">
+    <div class="alert-icon">🛒</div>
+    <div class="alert-body">
+      <div class="alert-label">App Store aberta</div>
+      <div class="alert-value">${fmtDt(appStoreLastTs)}</div>
+      <div class="alert-hint">Se foi após a partida → aplique o W.O!</div>
+    </div></div>` : ""
 
-  // ── NOVO: TOP APPS ────────────────────────────────────────────────────
+  // ── TOP APPS ────────────────────────────────────────────────────────────
   let topAppsSection = ""
   if (topApps && topApps.length > 0) {
     let maxHits = topApps[0][1]
     let topRows = topApps.map(([bid, hits], i) => {
       let pct = Math.round((hits / maxHits) * 100)
       let isSuspect = CHEAT_APPS[bid] || IPS_CHEAT_EXACT.has(bid)
-      let color = isSuspect ? "#ff4444" : i === 0 ? "#1e90ff" : "#3a5a72"
-      return `<div class="topapp-row">
-        <div class="topapp-num" style="color:${color}">#${i+1}</div>
-        <div class="topapp-info"><div class="topapp-bid" style="color:${isSuspect?"#ff8888":"#ccd"}">${bid}${isSuspect?` <span class="topapp-suspect">⚠ SUSPEITO</span>`:""}</div>
-          <div class="topapp-bar"><div class="topapp-fill" style="width:${pct}%;background:${color}55"></div></div></div>
-        <div class="topapp-hits">${hits.toLocaleString()}</div></div>`
+      let color = isSuspect ? "#ff1744" : i === 0 ? "#0057ff" : "#1a3660"
+      return `<div class="tapp-row">
+        <div class="tapp-rank" style="color:${color}">#${i+1}</div>
+        <div class="tapp-info">
+          <div class="tapp-bid" style="color:${isSuspect?"#ff6666":"#8899bb"}">${bid}${isSuspect?`<span class="tapp-suspect-tag">⚠ SUSPEITO</span>`:""}</div>
+          <div class="tapp-bar"><div class="tapp-fill" data-w="${pct}%" style="width:${pct}%;background:${color}66"></div></div>
+        </div>
+        <div class="tapp-hits">${hits.toLocaleString()}</div>
+      </div>`
     }).join("")
-    topAppsSection = `<div class="topapps-section">
-      <div class="section-mini-header">📊 Top Apps por Conexões</div>
-      <div class="topapp-rows">${topRows}</div></div>`
-  }
-
-  // ── NOVO: ANÁLISE TEMPORAL ──────────────────────────────────────────────
-  let temporalSection = ""
-  if (temporalAnalysis && temporalAnalysis.totalMinutes > 0) {
-    let spikeWarn = temporalAnalysis.spikes > 0
-      ? `<span class="temp-spike">⚡ ${temporalAnalysis.spikes} pico${temporalAnalysis.spikes>1?"s":""} anômalo${temporalAnalysis.spikes>1?"s":""} detectado${temporalAnalysis.spikes>1?"s":""}</span>` : ""
-    temporalSection = `<div class="temporal-section">
-      <div class="section-mini-header">⏱ Análise Temporal</div>
-      <div class="temporal-grid">
-        <div class="temp-card"><div class="temp-label">Minutos monitorados</div><div class="temp-val">${temporalAnalysis.totalMinutes}</div></div>
-        <div class="temp-card"><div class="temp-label">Média conexões/min</div><div class="temp-val">${temporalAnalysis.avgPerMinute}</div></div>
-        ${spikeWarn ? `<div class="temp-card temp-card-warn"><div class="temp-label">Picos de tráfego</div><div class="temp-val" style="color:#ff8800">${temporalAnalysis.spikes}</div></div>` : ""}
-      </div>
-      ${spikeWarn ? `<div class="temporal-hint">⚡ Picos de tráfego ${temporalAnalysis.spikes>1?"indicam":"indica"} uso intenso atípico — possível cheat ativo durante sessão de jogo</div>` : ""}
+    topAppsSection = `<div class="panel">
+      <div class="panel-head"><div class="panel-dot"></div><div class="panel-title">Top Apps por Conexões</div></div>
+      <div class="tapp-list">${topRows}</div>
     </div>`
   }
 
-  // ── IP CARDS ──────────────────────────────────────────────────────────────
+  // ── ANÁLISE TEMPORAL ─────────────────────────────────────────────────────
+  let temporalSection = ""
+  if (temporalAnalysis && temporalAnalysis.totalMinutes > 0) {
+    let hasSpikes = temporalAnalysis.spikes > 0
+    temporalSection = `<div class="panel">
+      <div class="panel-head"><div class="panel-dot"></div><div class="panel-title">Análise Temporal de Tráfego</div></div>
+      <div class="tgrid">
+        <div class="tcard">
+          <div class="tlabel">Minutos monitorados</div>
+          <div class="tval">${temporalAnalysis.totalMinutes}</div>
+        </div>
+        <div class="tcard">
+          <div class="tlabel">Média conexões/min</div>
+          <div class="tval">${temporalAnalysis.avgPerMinute}</div>
+        </div>
+        ${hasSpikes ? `<div class="tcard tcard-warn" style="grid-column:1/-1">
+          <div class="tlabel">Picos anômalos detectados</div>
+          <div class="tval warn">${temporalAnalysis.spikes}</div>
+        </div>` : ""}
+      </div>
+      ${hasSpikes ? `<div class="tspike">${temporalAnalysis.spikes} pico${temporalAnalysis.spikes>1?"s":""} anômalo${temporalAnalysis.spikes>1?"s":""} — uso atípico detectado</div>
+      <div class="thint">Picos de tráfego ${temporalAnalysis.spikes>1?"indicam":"indica"} uso intenso atípico — possível cheat ativo durante sessão de jogo</div>` : ""}
+    </div>`
+  }
+
+  // ── MÓDULO 1: IP vs Localização ─────────────────────────────────────────
+  let ipVsLocSection = ""
+  if (ipVsLocationFindings.length > 0) {
+    let rows = ipVsLocationFindings.slice(0, 20).map(f => {
+      let asnLabel = f.asnLabel ? ` — ${f.asnLabel}` : ""
+      let badge = f.isCheatASN
+        ? `<span class="adv-badge ab-crit">⚠ ASN Cheat${asnLabel}</span>`
+        : `<span class="adv-badge ab-high">🏠 Hosting/Proxy</span>`
+      return `<div class="adv-row">
+        <div class="adv-row-top">${badge}
+          <span class="adv-bundle">${f.bundleID}</span>
+          <span class="adv-delta">Δ ${f.diffMinutes}min</span>
+        </div>
+        <div class="adv-domain">${f.domain}</div>
+        <div class="adv-meta">
+          📍 Localização: <strong>${f.locationTs}</strong> &nbsp;|&nbsp;
+          🌐 Rede: <strong>${f.networkTs}</strong><br>
+          🗺 ${f.ipCountry} / ${f.ipCity} &nbsp;·&nbsp; ${f.isp}
+        </div>
+      </div>`
+    }).join("")
+    ipVsLocSection = `<div class="adv-panel">
+      <div class="adv-panel-head">
+        <span class="adv-panel-icon">📡</span>
+        <div class="adv-panel-text">
+          <div class="adv-panel-title">Módulo 1 — IP vs Localização</div>
+          <div class="adv-panel-sub">Infraestrutura VPS/Proxy ativa durante acesso a sensor GPS (±5 min)</div>
+        </div>
+        <span class="adv-panel-count adv-cnt-high">${ipVsLocationFindings.length}</span>
+      </div>
+      <div class="adv-body">${rows}</div>
+      <div class="adv-foot">⚠ App de cheat pode consultar o GPS para adaptar comportamento (evitar zonas monitoradas) enquanto roteia tráfego por VPS</div>
+    </div>`
+  }
+
+  // ── MÓDULO 2: Shortcuts Suspeitos ────────────────────────────────────────
+  let shortcutSection = ""
+  if (shortcutFindings.length > 0) {
+    let rows = shortcutFindings.map(f => {
+      let gameLabel = f.matchedGame
+        ? `Jogo: <strong style="color:var(--warn)">${f.matchedGame}</strong>`
+        : `Pico global de tráfego`
+      return `<div class="adv-row">
+        <div class="adv-row-top">
+          <span class="adv-badge ab-crit">⚡ Shortcut + Pico</span>
+          <span class="adv-bundle">${f.bundleID}</span>
+          <span class="adv-delta">Δ ${f.diffMinutes}min</span>
+        </div>
+        <div class="adv-meta">
+          🕐 intervalBegin: <strong>${f.intervalBegin}</strong><br>
+          ${gameLabel} &nbsp;·&nbsp; Categoria: ${f.category}
+        </div>
+      </div>`
+    }).join("")
+    shortcutSection = `<div class="adv-panel">
+      <div class="adv-panel-head">
+        <span class="adv-panel-icon">⚡</span>
+        <div class="adv-panel-text">
+          <div class="adv-panel-title">Módulo 2 — Shortcuts Suspeitos</div>
+          <div class="adv-panel-sub">com.apple.ShortcutsActions ativado durante pico de tráfego de jogo-alvo</div>
+        </div>
+        <span class="adv-panel-count adv-cnt-crit">${shortcutFindings.length}</span>
+      </div>
+      <div class="adv-body">${rows}</div>
+      <div class="adv-foot">⚠ Atalhos executados no mesmo instante de picos de rede do jogo podem indicar automação de cheat — aim-bot, recoil, ESP via script</div>
+    </div>`
+  }
+
+  // ── MÓDULO 3: Side-Loading ───────────────────────────────────────────────
+  let sideloadSection = ""
+  if (sideloadFindings.length > 0) {
+    let rows = sideloadFindings.map(f => {
+      let badge = f.severity === "CRITICAL"
+        ? `<span class="adv-badge ab-crit">🚨 Sideload Confirmado</span>`
+        : f.severity === "HIGH"
+          ? `<span class="adv-badge ab-high">⚠ Suspeito</span>`
+          : `<span class="adv-badge ab-med">ℹ Possível</span>`
+      let telRow = f.telemetryDomains.length
+        ? `<div class="adv-detail">📊 Telemetria: ${f.telemetryDomains.join(", ")}</div>` : ""
+      let sideRow = f.sideloadDomains.length
+        ? `<div class="adv-detail crit">🔗 Indicadores sideload: ${f.sideloadDomains.join(", ")}</div>` : ""
+      let noStoreRow = !f.hasOfficialDomain
+        ? `<div class="adv-detail" style="color:var(--amber)">❌ Sem domínio oficial da App Store</div>` : ""
+      return `<div class="adv-row">
+        <div class="adv-row-top">
+          ${badge}
+          <span class="adv-bundle">${f.bundleID}</span>
+          <span class="adv-delta">${f.hits} hits</span>
+        </div>
+        ${telRow}${sideRow}${noStoreRow}
+      </div>`
+    }).join("")
+    sideloadSection = `<div class="adv-panel">
+      <div class="adv-panel-head">
+        <span class="adv-panel-icon">📦</span>
+        <div class="adv-panel-text">
+          <div class="adv-panel-title">Módulo 3 — Side-Loading</div>
+          <div class="adv-panel-sub">Telemetria de terceiros sem domínio App Store oficial / indicadores de sideload detectados</div>
+        </div>
+        <span class="adv-panel-count adv-cnt-high">${sideloadFindings.length}</span>
+      </div>
+      <div class="adv-body">${rows}</div>
+      <div class="adv-foot">⚠ Apps sideloaded (AltStore, TrollStore, ESign) não passam pela revisão da Apple — podem conter cheats, keyloggers ou proxies MITM</div>
+    </div>`
+  }
+
+  // ── MÓDULO 4: URLs de Script ─────────────────────────────────────────────
+  let scriptSection = ""
+  if (scriptURLFindings.length > 0) {
+    let critScriptable = scriptURLFindings.filter(f => f.isScriptable)
+    let rows = scriptURLFindings.map(f => {
+      let badge = f.isScriptable
+        ? `<span class="adv-badge ab-crit">🚨 RISCO CRÍTICO — Scriptable</span>`
+        : `<span class="adv-badge ab-high">⚠ Script Remoto</span>`
+      return `<div class="adv-row ${f.isScriptable ? "adv-row-scriptable" : ""}">
+        <div class="adv-row-top">
+          ${badge}
+          <span class="adv-bundle">${f.bundleID}</span>
+          <span class="adv-delta">${f.hits} hits</span>
+        </div>
+        <div class="adv-domain">${f.domain}</div>
+        <div class="adv-meta">🔖 ${f.pattern}</div>
+        ${f.isScriptable
+          ? `<div class="adv-detail crit">dk.simonbs.Scriptable executa JavaScript arbitrário baixado dessa URL — vetor confirmado de cheat via script remoto</div>`
+          : ""}
+      </div>`
+    }).join("")
+    scriptSection = `<div class="adv-panel">
+      <div class="adv-panel-head">
+        <span class="adv-panel-icon">📜</span>
+        <div class="adv-panel-text">
+          <div class="adv-panel-title">Módulo 4 — URLs de Script Remoto</div>
+          <div class="adv-panel-sub">GitHub Raw, Gist, Pastebin, CDNs${critScriptable.length > 0 ? " — ⚠ SCRIPTABLE DETECTADO" : ""}</div>
+        </div>
+        <span class="adv-panel-count ${critScriptable.length > 0 ? "adv-cnt-crit" : "adv-cnt-high"}">${scriptURLFindings.length}</span>
+      </div>
+      <div class="adv-body">${rows}</div>
+      <div class="adv-foot">⚠ Acesso a repositórios de código remoto pode indicar download e execução de scripts de cheat em runtime</div>
+    </div>`
+  }
+
+  // ── MÓDULO 5: Ghost Activity ─────────────────────────────────────────────
+  let ghostActivitySection = ""
+  let { ghosts, orphans } = ghostActivityResult
+  if (ghosts.length > 0 || orphans.length > 0) {
+    let ghostRows = ghosts.map(g => {
+      let badge = g.isKnownCheat
+        ? `<span class="adv-badge ab-crit">🚨 Cheat Conhecido</span>`
+        : g.severity === "HIGH"
+          ? `<span class="adv-badge ab-high">👻 Fantasma Alta Ativ.</span>`
+          : `<span class="adv-badge ab-med">👻 App Fantasma</span>`
+      let domList = g.domains.slice(0, 5).map(d =>
+        `<span class="ghost-dom-chip">${d}</span>`
+      ).join(" ")
+      let catList = g.categories.length
+        ? `<div class="adv-detail">Sensores acessados: ${g.categories.join(", ")}</div>` : ""
+      return `<div class="adv-row">
+        <div class="adv-row-top">
+          ${badge}
+          <span class="adv-bundle">${g.bundleID}</span>
+          <span class="adv-delta">${g.hits} hits · ${g.netEvents} evt</span>
+        </div>
+        <div class="adv-domain">${domList}</div>
+        ${catList}
+      </div>`
+    }).join("")
+    let orphanBlock = orphans.length > 0
+      ? `<div class="adv-orphan">
+          <div class="adv-orphan-title">⬛ Apps instalados sem rastro no relatório — ${orphans.length} encontrados</div>
+          <div class="adv-orphan-chips">${orphans.map(o =>
+            `<span class="adv-oc ${o.isKnownCheat ? "cheat" : ""}">${o.bundleID}${o.isKnownCheat ? " ⚠" : ""}</span>`
+          ).join("")}</div>
+        </div>` : ""
+    ghostActivitySection = `<div class="adv-panel">
+      <div class="adv-panel-head">
+        <span class="adv-panel-icon">👻</span>
+        <div class="adv-panel-text">
+          <div class="adv-panel-title">Módulo 5 — Ghost Activity</div>
+          <div class="adv-panel-sub">BundleIDs ativos no relatório ausentes da lista de apps instalados fornecida</div>
+        </div>
+        <span class="adv-panel-count adv-cnt-high">${ghosts.length}</span>
+      </div>
+      ${ghosts.length > 0 ? `<div class="adv-body">${ghostRows}</div>` : ""}
+      ${orphanBlock}
+      <div class="adv-foot">⚠ Apps "fantasma" operam no dispositivo sem aparecer visivelmente — padrão de cheats injetados via TrollStore ou tweak de jailbreak</div>
+    </div>`
+  }
+
+
   let cards = ""
   if (findings.length === 0) {
-    cards = `<div class="ok">✓ Nenhum IP VPS / Hosting / Proxy detectado.</div>`
+    cards = `<div class="ok-panel">✓ Nenhum IP VPS / Hosting / Proxy detectado.</div>`
   } else {
     for (let f of findings) {
-      let tag = f.tldSuspect ? "DOMÍNIO SUSPEITO" : f.hosting ? "VPS/HOSTING" : f.proxy ? "PROXY/VPN" : "NUVEM"
       let cls = f.tldSuspect ? "tld-flag" : f.severity === "HIGH" ? "high" : "medium"
       let sev = f.tldSuspect ? "⚠ DOMÍNIO SUSPEITO" : f.severity === "HIGH" ? "SUSPEITO" : "POSSÍVEL"
-      let bundleList = f.bundles.map(b => `<span class="bundle">${b}</span>`).join(" ")
+      let bundleList = f.bundles.map(b => `<span class="bundle-chip">${b}</span>`).join(" ")
       cards += `<div class="card ${cls}">
-        <div class="card-header"><span class="badge ${cls}">${sev}</span><span class="conns">${f.hits} conexões</span></div>
+        <div class="card-head"><span class="badge ${cls}">${sev}</span><span class="conns">${f.hits} conexões</span></div>
         <div class="card-domain">${f.domain}</div>
-        <div class="grid">
-          <div class="row"><span class="label">IP</span><span class="val">${f.ip}</span></div>
-          <div class="row"><span class="label">País</span><span class="val">${f.country} / ${f.city}</span></div>
-          <div class="row"><span class="label">Provedor</span><span class="val isp">${f.isp}</span></div>
-          <div class="row"><span class="label">Org</span><span class="val">${f.org}</span></div>
-          ${f.reverse?`<div class="row"><span class="label">rDNS</span><span class="val rdns">${f.reverse}</span></div>`:""}
-          ${f.probe?`<div class="row"><span class="label">HTTP</span><span class="val">${f.probe.online?`<span class="http-on">● Online</span>${f.probe.status?` — HTTP ${f.probe.status}`:""}${f.probe.banner?` — <span class="http-banner">${f.probe.banner}</span>`:""}` :`<span class="http-off">● Offline / Sem resposta</span>`}</span></div>`:""}
-          <div class="row"><span class="label">Motivo</span><span class="val reason" data-reasons='${JSON.stringify(f.reasons)}'>${f.reasons.join("<br>")}</span></div>
-          <div class="row"><span class="label">Usado por</span><span class="val">${bundleList}</span></div>
+        <div class="cgrid">
+          <div class="crow"><span class="clabel">IP</span><span class="cval">${f.ip}</span></div>
+          <div class="crow"><span class="clabel">País</span><span class="cval">${f.country} / ${f.city}</span></div>
+          <div class="crow"><span class="clabel">Provedor</span><span class="cval isp">${f.isp}</span></div>
+          <div class="crow"><span class="clabel">Org</span><span class="cval">${f.org}</span></div>
+          ${f.reverse?`<div class="crow"><span class="clabel">rDNS</span><span class="cval rdns">${f.reverse}</span></div>`:""}
+          ${f.probe?`<div class="crow"><span class="clabel">HTTP</span><span class="cval">${f.probe.online?`<span class="http-on">● Online</span>${f.probe.status?` — HTTP ${f.probe.status}`:""}${f.probe.banner?` — <span class="http-banner">${f.probe.banner}</span>`:""}` :`<span class="http-off">● Offline / Sem resposta</span>`}</span></div>`:""}
+          <div class="crow"><span class="clabel">Motivo</span><span class="cval reason" data-reasons='${JSON.stringify(f.reasons)}'>${f.reasons.join("<br>")}</span></div>
+          <div class="crow"><span class="clabel">Usado por</span><span class="cval">${bundleList}</span></div>
         </div></div>`
     }
   }
 
-  let uptimeBg = uptimeWarning ? "background:linear-gradient(90deg,#1a0e00,#110800)" : "background:#000000"
-  let uptimeDotCl = uptimeWarning ? "background:#ff8800;box-shadow:0 0 8px #ff8800" : "background:#0066ff;box-shadow:0 0 8px rgba(0,102,255,0.5)"
-  let uptimeWarnBadge = uptimeWarning ? `<span class="uptime-warn-badge">⚠ MENOS DE 20MIN — Relatório pode não cobrir a partida inteira!</span>` : ""
-
-  // ── SCORE VISUAL (NOVO) ─────────────────────────────────────────────────
+  // ── RISK SCORE ───────────────────────────────────────────────────────────
   let riskScore = Math.min(100, criticalCount * 25 + highCount * 10 + medCount * 3)
   let riskLabel = riskScore >= 75 ? "ALTÍSSIMO" : riskScore >= 50 ? "ALTO" : riskScore >= 25 ? "MÉDIO" : riskScore > 0 ? "BAIXO" : "LIMPO"
-  let riskColor = riskScore >= 75 ? "#ff2244" : riskScore >= 50 ? "#ff6600" : riskScore >= 25 ? "#ffbb00" : riskScore > 0 ? "#88cc00" : "#00cc66"
+  let riskColor = riskScore >= 75 ? "#ff1744" : riskScore >= 50 ? "#ff6d00" : riskScore >= 25 ? "#ffab00" : riskScore > 0 ? "#69f0ae" : "#00e5a0"
   let verdictEmoji = riskScore >= 50 ? "🚨" : riskScore >= 25 ? "⚠️" : "✅"
 
   return `<!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta charset="utf-8">
 <title>PantherSS — Anti-Cheat Report</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Syne:wght@600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=DM+Mono:wght@300;400;500&family=Bebas+Neue&family=Inter:wght@300;400;500;600&display=swap');
 
+/* ═══════════════════════════════════════════════════════
+   TOKENS — AMOLED PREMIUM
+═══════════════════════════════════════════════════════ */
 :root {
-  --bg:       #000000;
-  --bg2:      #0a0f1f;
-  --bg3:      #111a2e;
-  --border:   #1a2847;
-  --blue:     #00008b;
-  --blue-light: #0066ff;
-  --blue-accent: #4a7aff;
-  --blue-dim: #001a3d;
-  --text:     #e8eef8;
-  --text-dim: #708595;
-  --gold:     #d4af37;
-  --gold-dim: #8b7520;
-  --critical: #ff1744;
-  --high:     #ff5252;
-  --medium:   #ffb300;
-  --success:  #1de9b6;
-  --panther:  #00008b;
+  --void:       #000000;
+  --abyss:      #03060f;
+  --deep:       #060d1a;
+  --surface:    #0a1120;
+  --panel:      #0d1628;
+  --lift:       #111e35;
+  --edge:       #1a2d50;
+  --rim:        #1e3460;
+
+  --azure:      #0057ff;
+  --azure-hi:   #1a6eff;
+  --azure-glow: #3380ff;
+  --azure-dim:  #0033aa;
+  --azure-fog:  rgba(0,87,255,0.08);
+  --azure-mist: rgba(0,87,255,0.04);
+
+  --plasma:     #00b4ff;
+  --plasma-dim: rgba(0,180,255,0.15);
+
+  --kill:       #ff1744;
+  --kill-glow:  rgba(255,23,68,0.25);
+  --kill-fog:   rgba(255,23,68,0.06);
+
+  --warn:       #ff6d00;
+  --warn-fog:   rgba(255,109,0,0.06);
+
+  --amber:      #ffab00;
+  --amber-fog:  rgba(255,171,0,0.06);
+
+  --ok:         #00e5a0;
+  --ok-fog:     rgba(0,229,160,0.06);
+
+  --ink:        #e2eaf8;
+  --ink-mid:    #8899bb;
+  --ink-dim:    #445577;
+  --ink-ghost:  rgba(226,234,248,0.04);
+
+  --r: Rajdhani, sans-serif;
+  --m: 'DM Mono', monospace;
+  --b: 'Bebas Neue', cursive;
+  --i: Inter, sans-serif;
+
+  --rad-xs: 4px;
+  --rad-sm: 8px;
+  --rad-md: 12px;
+  --rad-lg: 18px;
+  --rad-xl: 24px;
 }
 
-* { box-sizing:border-box; margin:0; padding:0; }
-
-html { scroll-behavior:smooth; }
-
+/* ═══════════════════════════════════════════════════════
+   RESET + BASE
+═══════════════════════════════════════════════════════ */
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html { scroll-behavior:smooth; -webkit-tap-highlight-color:transparent; }
 body {
-  background:#000000;
-  color:var(--text);
-  font-family:'JetBrains Mono', monospace;
-  font-size:12px;
+  background:var(--void);
+  color:var(--ink);
+  font-family:var(--i);
+  font-size:13px;
+  line-height:1.5;
   min-height:100vh;
   overflow-x:hidden;
+  -webkit-font-smoothing:antialiased;
 }
 
-/* ── ANIMAÇÕES ─────────────────────────────────────────────────────────── */
-@keyframes fadeInDown {
-  from { opacity:0; transform:translateY(-20px); }
-  to { opacity:1; transform:translateY(0); }
+/* ═══════════════════════════════════════════════════════
+   KEYFRAMES
+═══════════════════════════════════════════════════════ */
+@keyframes fadeUp   { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:none; } }
+@keyframes fadeDown { from { opacity:0; transform:translateY(-16px); } to { opacity:1; transform:none; } }
+@keyframes fadeIn   { from { opacity:0; } to { opacity:1; } }
+@keyframes slideR   { from { opacity:0; transform:translateX(-20px); } to { opacity:1; transform:none; } }
+@keyframes scaleUp  { from { opacity:0; transform:scale(0.92); } to { opacity:1; transform:scale(1); } }
+@keyframes scanline { 0%,100% { transform:translateY(-100%); } }
+@keyframes breathe  { 0%,100% { opacity:0.5; } 50% { opacity:1; } }
+@keyframes spinArc  { to { stroke-dashoffset: 0; } }
+@keyframes gridFade { from { opacity:0; } to { opacity:1; } }
+@keyframes ripple   { from { transform:scale(0.8); opacity:1; } to { transform:scale(2.2); opacity:0; } }
+@keyframes blink    { 0%,100%{opacity:1;} 50%{opacity:0.25;} }
+@keyframes shimmer  { from{background-position:-200% center;} to{background-position:200% center;} }
+@keyframes borderPulse { 0%,100%{border-color:rgba(0,87,255,0.2);} 50%{border-color:rgba(0,87,255,0.5);} }
+@keyframes waveX    { 0%{transform:scaleX(0.95);} 50%{transform:scaleX(1);} 100%{transform:scaleX(0.95);} }
+@keyframes floatUp  { 0%,100%{transform:translateY(0);} 50%{transform:translateY(-3px);} }
+
+/* ═══════════════════════════════════════════════════════
+   AMBIENT GRID BACKGROUND
+═══════════════════════════════════════════════════════ */
+body::before {
+  content:'';
+  position:fixed; inset:0; z-index:0; pointer-events:none;
+  background-image:
+    linear-gradient(rgba(0,87,255,0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,87,255,0.025) 1px, transparent 1px);
+  background-size:40px 40px;
+  mask-image:radial-gradient(ellipse 80% 60% at 50% 0%, black 0%, transparent 80%);
+  animation:gridFade 2s ease-out both;
+}
+body::after {
+  content:'';
+  position:fixed; top:0; left:0; right:0; height:60vh; z-index:0; pointer-events:none;
+  background:radial-gradient(ellipse 70% 40% at 50% -10%, rgba(0,60,180,0.18) 0%, transparent 70%);
 }
 
-@keyframes fadeInUp {
-  from { opacity:0; transform:translateY(20px); }
-  to { opacity:1; transform:translateY(0); }
+/* ═══════════════════════════════════════════════════════
+   SCANLINE OVERLAY
+═══════════════════════════════════════════════════════ */
+.scanline-wrap {
+  position:fixed; inset:0; z-index:1; pointer-events:none; overflow:hidden;
+}
+.scanline {
+  position:absolute; top:0; left:0; right:0; height:120px;
+  background:linear-gradient(transparent, rgba(0,87,255,0.022), transparent);
+  animation:scanline 8s linear infinite;
 }
 
-@keyframes scaleIn {
-  from { opacity:0; transform:scale(0.95); }
-  to { opacity:1; transform:scale(1); }
-}
+/* ═══════════════════════════════════════════════════════
+   LAYOUT WRAPPER
+═══════════════════════════════════════════════════════ */
+.layout { position:relative; z-index:10; }
 
-@keyframes glowPulse {
-  0%, 100% { box-shadow:0 0 10px rgba(0,102,255,0.2); }
-  50% { box-shadow:0 0 20px rgba(0,102,255,0.4); }
-}
-
-@keyframes slideInLeft {
-  from { opacity:0; transform:translateX(-30px); }
-  to { opacity:1; transform:translateX(0); }
-}
-
-@keyframes pulse {
-  0%, 100% { opacity:1; transform:scale(1); }
-  50% { opacity:0.4; transform:scale(0.9); }
-}
-
-/* ── HERO ─────────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════
+   HERO — COMMAND DECK
+═══════════════════════════════════════════════════════ */
 .hero {
-  position:relative;
-  overflow:hidden;
-  background:#000000;
-  border-bottom:1px solid var(--border);
-  padding:20px 24px 18px;
-  text-align:center;
+  position:relative; overflow:hidden;
+  padding:32px 20px 24px;
+  background:var(--void);
+  border-bottom:1px solid var(--edge);
 }
-
-.hero::before {
-  display:none;
+.hero-noise {
+  position:absolute; inset:0; pointer-events:none;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  background-size:256px 256px; opacity:0.4;
 }
-
-.hero::after {
-  display:none;
-}
-
-.hero-bg-stripes {
-  display:none;
-}
-
 .hero-glow {
-  display:none;
+  position:absolute; top:-40px; left:50%; transform:translateX(-50%);
+  width:300px; height:200px; pointer-events:none;
+  background:radial-gradient(ellipse, rgba(0,80,220,0.22) 0%, transparent 70%);
+  animation:breathe 4s ease-in-out infinite;
 }
 
-.panther-logo {
-  width:35px;
-  height:35px;
-  border-radius:8px;
-  margin:0 auto 8px;
-  border:1.5px solid rgba(0,102,255,0.25);
-  background:#000000;
-  box-shadow:0 1px 4px rgba(0,102,255,0.06);
-  object-fit:cover;
-  display:block;
-  position:relative;
-  z-index:10;
-  animation:scaleIn 0.6s ease-out;
+/* ── LOGOTIPO ── */
+.logo-wrap {
+  display:flex; flex-direction:column; align-items:center; gap:0;
+  position:relative; z-index:2;
+  animation:fadeDown 0.7s cubic-bezier(.22,1,.36,1) both;
+}
+.logo-eyebrow {
+  font-family:var(--m); font-size:9px; letter-spacing:3px;
+  color:var(--azure-glow); text-transform:uppercase; margin-bottom:6px;
+  opacity:0.7;
+}
+.logo-mark {
+  display:flex; align-items:baseline; gap:0; line-height:1;
+}
+.logo-panther {
+  font-family:var(--b); font-size:52px; letter-spacing:2px;
+  color:#fff; text-shadow:0 0 40px rgba(0,87,255,0.35);
+}
+.logo-ss {
+  font-family:var(--b); font-size:52px; letter-spacing:2px;
+  background:linear-gradient(135deg, var(--azure-hi), var(--plasma));
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+  background-clip:text;
+  text-shadow:none;
+  filter:drop-shadow(0 0 12px rgba(0,87,255,0.5));
+}
+.logo-tagline {
+  font-family:var(--m); font-size:8px; letter-spacing:2.5px;
+  color:var(--ink-dim); text-transform:uppercase; margin-top:6px;
+}
+.logo-bar {
+  width:60px; height:2px; margin:10px auto 0;
+  background:linear-gradient(90deg, transparent, var(--azure-hi), transparent);
+  animation:waveX 3s ease-in-out infinite;
 }
 
-.hero-eyebrow {
-  font-family:'Syne', sans-serif;
-  font-size:8px;
-  letter-spacing:2px;
-  color:rgba(0,102,255,0.5);
-  text-transform:uppercase;
-  margin-bottom:4px;
-  font-weight:600;
-  animation:fadeInDown 0.6s ease-out 0.1s both;
+/* ── LANG SWITCHER ── */
+.lang-bar {
+  display:flex; justify-content:center; gap:6px; margin-top:16px;
+  position:relative; z-index:2;
+  animation:fadeUp 0.7s cubic-bezier(.22,1,.36,1) 0.15s both;
 }
-
-.hero-name {
-  font-family:'Syne', sans-serif;
-  font-size:32px;
-  font-weight:800;
-  letter-spacing:-0.5px;
-  color:#fff;
-  line-height:1;
-  margin-bottom:0px;
-  text-shadow:0 2px 6px rgba(0,0,139,0.15);
-  position:relative;
-  z-index:10;
-  animation:fadeInDown 0.6s ease-out 0.2s both;
-}
-
-.hero-name span {
-  color:var(--blue-light);
-  text-shadow:0 2px 6px rgba(0,102,255,0.2);
-}
-
-.hero-sub {
-  font-family:'Syne', sans-serif;
-  font-size:9px;
-  letter-spacing:1.2px;
-  color:rgba(224,224,255,0.4);
-  text-transform:uppercase;
-  margin-bottom:10px;
-  font-weight:600;
-  animation:fadeInDown 0.6s ease-out 0.3s both;
-}
-
-.hero-file {
-  font-size:9px;
-  color:var(--text-dim);
-  word-break:break-all;
-  padding:7px 10px;
-  background:rgba(0,0,139,0.04);
-  border-radius:8px;
-  border:1px solid rgba(0,102,255,0.15);
-  margin-bottom:8px;
-  line-height:1.4;
-  text-align:left;
-  animation:fadeInUp 0.6s ease-out 0.3s both;
-}
-
-.hero-file strong {
-  color:var(--blue-light);
-}
-
-.hero-grid {
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:7px;
-  position:relative;
-  z-index:10;
-  animation:fadeInUp 0.6s ease-out 0.4s both;
-}
-
-.hg-card {
-  background:rgba(0,0,139,0.04);
-  border-radius:10px;
-  padding:10px 11px;
-  border:1px solid rgba(0,102,255,0.15);
-  box-shadow:0 2px 8px rgba(0,0,0,0.2);
-  transition:all 0.3s ease;
-}
-
-.hg-card:hover {
-  border-color:var(--blue-accent);
-  background:rgba(0,0,139,0.08);
-  box-shadow:0 4px 12px rgba(0,102,255,0.12);
-}
-
-.hg-label {
-  font-size:8px;
-  color:var(--text-dim);
-  letter-spacing:0.6px;
-  text-transform:uppercase;
-  margin-bottom:3px;
-  font-family:'Syne', sans-serif;
-  font-weight:600;
-}
-
-.hg-val {
-  font-size:12px;
-  color:var(--text);
-  font-weight:600;
-}
-
-.hg-val.blue {
-  color:var(--blue-light);
-  font-weight:700;
-  font-size:14px;
-}
-
-.hg-val.warn {
-  color:var(--critical);
-  font-weight:700;
-}
-
-.hg-card-full {
-  grid-column:1/-1;
-}
-
-.hg-card-warn {
-  background:rgba(255,23,68,0.08) !important;
-  border-color:rgba(255,23,68,0.2) !important;
-}
-
-/* ── VERDICT SCORE ────────────────────────────────────── */
-.verdict-bar {
-  background:#000000;
-  border-bottom:1px solid var(--border);
-  padding:16px 24px;
-  display:flex;
-  align-items:center;
-  gap:18px;
-  box-shadow:inset 0 1px 0 rgba(0,102,255,0.08);
-  animation:slideInLeft 0.6s ease-out;
-}
-.verdict-emoji { font-size:32px; flex-shrink:0; animation:glowPulse 2.5s ease-in-out infinite; }
-.verdict-info { flex:1; }
-.verdict-label { font-size:9px; color:var(--text-dim); letter-spacing:1.5px; text-transform:uppercase; margin-bottom:3px; font-family:'Syne', sans-serif; font-weight:600; }
-.verdict-text { font-family:'Syne', sans-serif; font-size:22px; font-weight:700; letter-spacing:-0.5px; }
-.verdict-score-ring { position:relative; width:56px; height:56px; flex-shrink:0; }
-.verdict-score-ring svg { transform:rotate(-90deg); }
-.verdict-score-num {
-  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-  font-family:'Syne', sans-serif; font-size:14px; font-weight:900;
-}
-
-/* ── UPTIME BAR ───────────────────────────────────────── */
-.uptime-bar {
-  padding:10px 24px;
-  display:flex;
-  align-items:center;
-  gap:10px;
-  flex-wrap:wrap;
-  border-bottom:1px solid var(--border);
-  background:#000000;
-}
-.uptime-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; animation:pulse 2.5s ease-in-out infinite; box-shadow:0 0 8px currentColor; }
-.uptime-text { font-size:11px; color:#708595; }
-.uptime-text strong { color:var(--blue-light); font-weight:600; }
-.uptime-warn-badge {
-  background:rgba(255,23,68,0.08);
-  color:var(--critical);
-  border:1px solid rgba(255,23,68,0.2);
-  font-size:8px;
-  padding:3px 8px;
-  border-radius:10px;
-  font-weight:700;
-  font-family:'Syne', sans-serif;
-}
-
-/* ── LANG BUTTONS ────────────────────────────────────── */
-.lang-bar { display:flex; justify-content:center; gap:6px; margin-bottom:16px; position:relative; z-index:10; }
 .lang-btn {
-  background:rgba(0,0,139,0.06); border:1px solid rgba(0,0,139,0.15);
-  border-radius:20px; color:var(--text-dim); font-size:9px; letter-spacing:0.8px;
-  padding:5px 12px; cursor:pointer; font-family:'Syne', sans-serif;
-  transition:all 0.3s ease; text-transform:uppercase; font-weight:600;
-  animation:fadeInDown 0.6s ease-out 0.5s both;
+  background:transparent; border:1px solid var(--edge);
+  border-radius:var(--rad-sm); color:var(--ink-dim);
+  font-family:var(--m); font-size:9px; letter-spacing:1.5px;
+  padding:5px 13px; cursor:pointer; text-transform:uppercase;
+  transition:all 0.25s ease;
 }
-.lang-btn:hover { background:rgba(0,0,139,0.12); border-color:var(--blue-accent); }
-.lang-btn.active { background:rgba(0,102,255,0.12); border-color:var(--blue-light); color:var(--blue-light); box-shadow:0 0 10px rgba(0,102,255,0.15); }
-
-/* ── CONTENT ──────────────────────────────────────────────────────────── */
-.content {
-  padding:20px 24px;
+.lang-btn:hover { border-color:var(--azure-dim); color:var(--ink); }
+.lang-btn.active {
+  background:rgba(0,87,255,0.12); border-color:var(--azure-hi);
+  color:var(--azure-hi); box-shadow:0 0 16px rgba(0,87,255,0.15), inset 0 0 12px rgba(0,87,255,0.06);
 }
 
-/* ── SUMMARY ──────────────────────────────────────────────────────────── */
-.summary {
-  display:flex;
-  gap:10px;
+/* ── HERO FILE CHIP ── */
+.hero-file {
+  display:flex; align-items:center; gap:8px;
+  margin:16px auto 0; max-width:340px;
+  background:var(--ink-ghost); border:1px solid var(--edge);
+  border-radius:var(--rad-sm); padding:7px 12px;
+  font-family:var(--m); font-size:9px; color:var(--ink-mid);
+  word-break:break-all; position:relative; z-index:2;
+  animation:fadeUp 0.7s cubic-bezier(.22,1,.36,1) 0.2s both;
+}
+.hero-file-dot { width:6px; height:6px; border-radius:50%; background:var(--azure-hi); flex-shrink:0; animation:blink 2s ease-in-out infinite; }
+.hero-file strong { color:var(--ink); }
+
+/* ── HERO STAT GRID ── */
+.hero-grid {
+  display:grid; grid-template-columns:1fr 1fr; gap:8px;
+  margin:14px 0 0; position:relative; z-index:2;
+  animation:fadeUp 0.7s cubic-bezier(.22,1,.36,1) 0.3s both;
+}
+.hg-card {
+  background:var(--ink-ghost); border:1px solid var(--edge);
+  border-radius:var(--rad-md); padding:12px 13px;
+  transition:all 0.3s ease; position:relative; overflow:hidden;
+}
+.hg-card::before {
+  content:''; position:absolute; inset:0; opacity:0;
+  background:radial-gradient(circle at 50% 0%, rgba(0,87,255,0.08) 0%, transparent 70%);
+  transition:opacity 0.3s;
+}
+.hg-card:hover::before { opacity:1; }
+.hg-card:hover { border-color:rgba(0,87,255,0.3); transform:translateY(-1px); }
+.hg-label {
+  font-family:var(--m); font-size:8px; letter-spacing:1px;
+  color:var(--ink-dim); text-transform:uppercase; margin-bottom:4px;
+}
+.hg-val { font-family:var(--r); font-size:14px; font-weight:600; color:var(--ink); }
+.hg-val.blue { color:var(--azure-hi); font-size:16px; font-weight:700; }
+.hg-val.warn { color:var(--kill); font-weight:700; }
+.hg-card-full { grid-column:1/-1; }
+.hg-card-warn { background:var(--kill-fog); border-color:rgba(255,23,68,0.2); animation:borderPulse 2s ease infinite; }
+
+/* ═══════════════════════════════════════════════════════
+   VERDICT STRIP
+═══════════════════════════════════════════════════════ */
+.verdict-strip {
+  display:flex; align-items:center; gap:16px;
+  padding:18px 20px;
+  background:var(--abyss);
+  border-bottom:1px solid var(--edge);
+  position:relative; overflow:hidden;
+  animation:slideR 0.6s cubic-bezier(.22,1,.36,1) 0.1s both;
+}
+.verdict-strip::after {
+  content:''; position:absolute; bottom:0; left:0; right:0; height:1px;
+  background:linear-gradient(90deg, transparent, var(--azure-dim), transparent);
+}
+.verdict-icon { font-size:36px; flex-shrink:0; animation:floatUp 3s ease-in-out infinite; }
+.verdict-body { flex:1; min-width:0; }
+.verdict-label {
+  font-family:var(--m); font-size:8px; letter-spacing:2px;
+  color:var(--ink-dim); text-transform:uppercase; margin-bottom:3px;
+}
+.verdict-value {
+  font-family:var(--b); font-size:30px; letter-spacing:1px; line-height:1;
+}
+.verdict-ring { position:relative; width:58px; height:58px; flex-shrink:0; }
+.verdict-ring svg { transform:rotate(-90deg); display:block; }
+.verdict-ring-num {
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  font-family:var(--b); font-size:16px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   UPTIME RAIL
+═══════════════════════════════════════════════════════ */
+.uptime-rail {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:10px 20px;
+  background:var(--void); border-bottom:1px solid var(--edge);
+}
+.uptime-beacon {
+  width:7px; height:7px; border-radius:50%; flex-shrink:0;
+  animation:blink 2.5s ease-in-out infinite;
+}
+.uptime-text { font-family:var(--m); font-size:10px; color:var(--ink-dim); }
+.uptime-text strong { color:var(--azure-hi); }
+.uptime-pill {
+  background:rgba(255,23,68,0.1); border:1px solid rgba(255,23,68,0.22);
+  color:var(--kill); font-family:var(--m); font-size:8px; letter-spacing:0.5px;
+  padding:3px 9px; border-radius:20px; font-weight:500;
+}
+
+/* ═══════════════════════════════════════════════════════
+   MAIN CONTENT
+═══════════════════════════════════════════════════════ */
+.content { padding:16px 20px 40px; }
+
+/* ═══════════════════════════════════════════════════════
+   ALERT BANNERS (stale / ff / appstore / roots)
+═══════════════════════════════════════════════════════ */
+.alert-banner {
+  display:flex; align-items:flex-start; gap:14px;
+  border-radius:var(--rad-md); padding:14px 16px;
+  margin-bottom:10px; border:1px solid;
+  position:relative; overflow:hidden;
+  animation:fadeUp 0.5s cubic-bezier(.22,1,.36,1) both;
+}
+.alert-banner::before {
+  content:''; position:absolute; top:0; left:0; width:3px; height:100%;
+}
+.alert-ff    { background:var(--ok-fog);    border-color:rgba(0,229,160,0.15); }
+.alert-ff::before    { background:var(--ok); }
+.alert-store { background:var(--amber-fog); border-color:rgba(255,171,0,0.18); }
+.alert-store::before { background:var(--amber); }
+.alert-stale { background:var(--warn-fog);  border-color:rgba(255,109,0,0.18); }
+.alert-stale::before { background:var(--warn); }
+.alert-roots { background:var(--kill-fog);  border-color:rgba(255,23,68,0.18); animation:borderPulse 2s ease infinite; }
+.alert-roots::before { background:var(--kill); }
+
+.alert-icon { font-size:22px; flex-shrink:0; margin-top:1px; }
+.alert-body { flex:1; min-width:0; }
+.alert-label {
+  font-family:var(--m); font-size:8px; letter-spacing:1.5px;
+  text-transform:uppercase; font-weight:500; margin-bottom:4px;
+}
+.alert-ff    .alert-label { color:var(--ok); }
+.alert-store .alert-label { color:var(--amber); }
+.alert-stale .alert-label { color:var(--warn); }
+.alert-roots .alert-label { color:var(--kill); }
+.alert-value { font-family:var(--r); font-size:16px; font-weight:700; color:var(--ink); margin-bottom:3px; }
+.alert-sub { font-family:var(--i); font-size:9px; color:var(--ink-mid); line-height:1.5; }
+.alert-hint { font-family:var(--i); font-size:9px; color:var(--ink-dim); margin-top:3px; }
+.ff-session-block { display:flex; flex-direction:column; gap:4px; }
+.ff-session-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:5px 0; border-top:1px solid rgba(255,255,255,0.04); }
+.ff-session-row:first-child { border-top:none; }
+.ff-snum { font-family:var(--m); font-size:8px; color:var(--ink-dim); }
+.ff-sts { font-family:var(--r); font-size:14px; font-weight:600; color:var(--ink); }
+.ff-login-badge { font-family:var(--m); font-size:8px; padding:3px 8px; border-radius:var(--rad-sm); white-space:nowrap; }
+
+/* ═══════════════════════════════════════════════════════
+   STAT ROW
+═══════════════════════════════════════════════════════ */
+.stat-row {
+  display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;
   margin-bottom:20px;
+  animation:fadeUp 0.6s cubic-bezier(.22,1,.36,1) 0.2s both;
 }
-
-.stat {
-  flex:1;
-  background:rgba(0,0,139,0.06);
-  border-radius:12px;
-  padding:14px 10px;
-  text-align:center;
-  border:1px solid rgba(0,102,255,0.15);
-  box-shadow:0 2px 8px rgba(0,0,0,0.2);
-  transition:all 0.3s ease;
-  animation:scaleIn 0.6s ease-out 0.5s both;
+.stat-card {
+  background:var(--ink-ghost); border:1px solid var(--edge);
+  border-radius:var(--rad-md); padding:16px 12px 14px;
+  text-align:center; position:relative; overflow:hidden;
+  transition:all 0.3s ease; cursor:default;
 }
-
-.stat:hover {
-  border-color:var(--blue-accent);
-  background:rgba(0,0,139,0.1);
-  box-shadow:0 4px 12px rgba(0,102,255,0.12);
-  transform:translateY(-2px);
+.stat-card::after {
+  content:''; position:absolute; bottom:0; left:0; right:0; height:2px;
+  opacity:0.5; transition:opacity 0.3s;
 }
+.stat-card:hover::after { opacity:1; }
+.stat-card:hover { transform:translateY(-2px); }
+.stat-c::after { background:var(--kill); }
+.stat-h::after { background:var(--azure-hi); }
+.stat-m::after { background:var(--amber); }
+.stat-c { border-color:rgba(255,23,68,0.15); }
+.stat-h { border-color:rgba(0,87,255,0.2); }
+.stat-m { border-color:rgba(255,171,0,0.15); }
+.stat-card:hover.stat-c { border-color:rgba(255,23,68,0.35); box-shadow:0 8px 24px rgba(255,23,68,0.1); }
+.stat-card:hover.stat-h { border-color:rgba(0,87,255,0.4); box-shadow:0 8px 24px rgba(0,87,255,0.12); }
+.stat-card:hover.stat-m { border-color:rgba(255,171,0,0.35); box-shadow:0 8px 24px rgba(255,171,0,0.08); }
+.stat-num { font-family:var(--b); font-size:38px; line-height:1; margin-bottom:4px; }
+.stat-c .stat-num { color:var(--kill); text-shadow:0 0 20px rgba(255,23,68,0.4); }
+.stat-h .stat-num { color:var(--azure-hi); text-shadow:0 0 20px rgba(0,87,255,0.4); }
+.stat-m .stat-num { color:var(--amber); text-shadow:0 0 20px rgba(255,171,0,0.3); }
+.stat-lbl { font-family:var(--m); font-size:8px; letter-spacing:1.2px; text-transform:uppercase; color:var(--ink-dim); }
 
-.stat .num {
-  font-family:'Syne', sans-serif;
-  font-size:28px;
-  font-weight:800;
-  line-height:1;
-  margin-bottom:4px;
+/* ═══════════════════════════════════════════════════════
+   SECTION HEADERS
+═══════════════════════════════════════════════════════ */
+.sec-head {
+  display:flex; align-items:center; gap:12px;
+  margin:24px 0 12px; position:relative;
+  animation:fadeDown 0.5s cubic-bezier(.22,1,.36,1) both;
 }
-
-.stat .lbl {
-  font-size:9px;
-  color:var(--text-dim);
-  margin-top:2px;
-  letter-spacing:0.8px;
-  text-transform:uppercase;
-  font-family:'Syne', sans-serif;
-  font-weight:600;
+.sec-head::before {
+  content:''; position:absolute; bottom:-6px; left:0; right:0; height:1px;
+  background:linear-gradient(90deg, var(--edge) 0%, transparent 100%);
 }
+.sec-icon {
+  width:34px; height:34px; border-radius:var(--rad-sm);
+  display:flex; align-items:center; justify-content:center;
+  font-size:16px; flex-shrink:0;
+  border:1px solid;
+}
+.sec-ic-crit { background:rgba(255,23,68,0.08); border-color:rgba(255,23,68,0.2); }
+.sec-ic-high { background:rgba(0,87,255,0.08);  border-color:rgba(0,87,255,0.2); }
+.sec-ic-med  { background:rgba(255,171,0,0.06); border-color:rgba(255,171,0,0.2); }
+.sec-text { flex:1; }
+.sec-title {
+  font-family:var(--r); font-size:13px; font-weight:700;
+  letter-spacing:0.5px; text-transform:uppercase;
+}
+.sec-tc { color:var(--kill); }
+.sec-th { color:var(--azure-hi); }
+.sec-tm { color:var(--amber); }
+.sec-sub { font-family:var(--m); font-size:8px; color:var(--ink-dim); margin-top:1px; }
+.sec-count {
+  font-family:var(--b); font-size:18px; padding:2px 12px;
+  border-radius:20px; border:1px solid; flex-shrink:0;
+}
+.sec-cc { color:var(--kill); border-color:rgba(255,23,68,0.25); background:rgba(255,23,68,0.06); }
+.sec-ch { color:var(--azure-hi); border-color:rgba(0,87,255,0.25); background:var(--azure-fog); }
+.sec-cm { color:var(--amber); border-color:rgba(255,171,0,0.25); background:var(--amber-fog); }
 
-/* ── SECTION HEADERS ─────────────────────────────────── */
-.section-header { display:flex; align-items:center; gap:10px; margin-bottom:14px; margin-top:6px; animation:fadeInDown 0.6s ease-out; }
-.sh-icon { width:36px; height:36px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; background:rgba(0,102,255,0.08); }
-.sh-text { flex:1; }
-.sh-title { font-family:'Syne',sans-serif; font-size:12px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; }
-.sh-sub { font-size:8px; color:var(--text-dim); margin-top:1px; }
-.sh-count { font-size:11px; font-weight:700; padding:3px 12px; border-radius:20px; font-family:'Syne',sans-serif; }
-.sh-critical .sh-icon { background:rgba(255,23,68,0.1); }
-.sh-critical .sh-title { color:var(--critical); }
-.sh-critical .sh-count { background:rgba(255,23,68,0.08); color:var(--critical); border:1px solid rgba(255,23,68,0.15); }
-.sh-high .sh-icon { background:rgba(255,82,82,0.08); }
-.sh-high .sh-title { color:var(--high); }
-.sh-high .sh-count { background:rgba(255,82,82,0.08); color:var(--high); border:1px solid rgba(255,82,82,0.15); }
-.sh-medium .sh-icon { background:rgba(255,179,0,0.08); }
-.sh-medium .sh-title { color:var(--medium); }
-.sh-medium .sh-count { background:rgba(255,179,0,0.08); color:var(--medium); border:1px solid rgba(255,179,0,0.15); }
-.divider { height:1px; background:rgba(0,102,255,0.15); margin:16px 0; }
-
-/* ── CARDS ───────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════
+   DETECTION CARDS
+═══════════════════════════════════════════════════════ */
 .card {
-  background:rgba(0,0,139,0.06);
-  border-radius:14px;
-  margin-bottom:10px;
-  overflow:hidden;
-  border:1px solid rgba(0,102,255,0.15);
-  border-left:4px solid var(--blue-accent);
-  box-shadow:0 2px 8px rgba(0,0,0,0.2);
-  transition:all 0.3s ease;
-  animation:slideInLeft 0.5s ease-out;
+  border-radius:var(--rad-lg); margin-bottom:10px;
+  border:1px solid var(--edge); overflow:hidden;
+  position:relative; transition:all 0.3s ease;
+  animation:fadeUp 0.5s cubic-bezier(.22,1,.36,1) both;
+  background:var(--deep);
 }
-.card:hover { 
-  background:rgba(0,0,139,0.1);
-  box-shadow:0 6px 16px rgba(0,102,255,0.12);
-  border-color:var(--blue-accent);
-  transform:translateX(4px);
+.card::before {
+  content:''; position:absolute; top:0; left:0; width:3px; height:100%;
+  transition:width 0.3s ease;
 }
-.card.critical { border-left-color:var(--critical); background:rgba(255,23,68,0.06); }
-.card.critical:hover { background:rgba(255,23,68,0.08); }
-.card.tld-flag { border-left-color:var(--medium); background:rgba(255,179,0,0.06); }
-.card.high { border-left-color:var(--high); background:rgba(255,82,82,0.06); }
-.card.medium { border-left-color:var(--medium); background:rgba(255,179,0,0.06); }
-.card-header { display:flex; justify-content:space-between; align-items:center; padding:12px 14px 8px; }
-.badge { font-size:10px; font-weight:700; padding:4px 11px; border-radius:20px; letter-spacing:0.3px; font-family:'Syne',sans-serif; }
-.badge.critical { background:rgba(255,23,68,0.12); color:#ff4477; border:1px solid rgba(255,23,68,0.3); }
-.badge.tld-flag { background:rgba(255,179,0,0.1); color:#ffb300; border:1px solid rgba(255,179,0,0.3); }
-.badge.high { background:rgba(255,82,82,0.1); color:#ff6666; border:1px solid rgba(255,82,82,0.3); }
-.badge.medium { background:rgba(255,179,0,0.08); color:#ffb300; border:1px solid rgba(255,179,0,0.3); }
-.conns { font-size:11px; color:var(--text-dim); }
-.card-domain { font-size:12px; font-weight:600; color:#fff; padding:0 14px 8px; word-break:break-all; }
-.grid { padding:0 14px 12px; }
-.row { display:flex; gap:10px; padding:6px 0; border-top:1px solid rgba(0,0,139,0.1); align-items:flex-start; }
-.label { color:var(--text-dim); min-width:70px; font-size:10px; padding-top:2px; flex-shrink:0; line-height:1.4; font-family:'Syne',sans-serif; font-weight:600; }
-.sub { color:var(--blue-dim); font-size:9px; }
-.val { color:#c8d8e8; word-break:break-all; flex:1; font-size:11px; line-height:1.6; }
-.isp { color:var(--medium); font-weight:600; }
-.reason { color:var(--critical); font-weight:600; }
-.rdns { color:var(--blue-light); font-style:italic; }
-.http-on { color:var(--success); font-weight:700; }
-.http-off { color:var(--text-dim); font-weight:700; }
-.http-banner { color:var(--critical); font-weight:700; text-transform:uppercase; font-size:10px; }
-.none { color:var(--text-dim); }
-.bundle {
-  display:inline-block;
-  background:rgba(0,0,139,0.08);
-  border-radius:8px;
-  padding:3px 8px;
-  font-size:9px;
-  color:var(--text-dim);
-  margin:2px;
-  word-break:break-all;
-  border:1px solid rgba(0,0,139,0.2);
-  font-family:'Syne',sans-serif;
-}
-.bundle {
-  display:inline-block;
-  background:rgba(0,0,139,0.08);
-  border-radius:8px;
-  padding:3px 8px;
-  font-size:9px;
-  color:var(--text-dim);
-  margin:2px;
-  word-break:break-all;
-  border:1px solid rgba(0,0,139,0.2);
-  font-family:'Syne',sans-serif;
-}
-.domain-row { padding:4px 0; font-size:11px; color:#c8d8e8; word-break:break-all; }
-.domain-badge { display:inline-block; font-size:9px; font-weight:700; padding:2px 6px; border-radius:6px; margin-right:4px; vertical-align:middle; font-family:'Syne',sans-serif; }
-.domain-badge.high { background:rgba(255,82,82,0.1); color:#ff6666; }
-.domain-badge.medium { background:rgba(255,179,0,0.08); color:#ffb300; }
-.ok {
-  background:rgba(29,233,182,0.06);
-  border:1px solid rgba(29,233,182,0.15);
-  color:var(--success);
-  padding:18px;
-  border-radius:12px;
-  text-align:center;
-  font-family:'Syne',sans-serif;
-  font-size:14px;
-  font-weight:600;
-  animation:scaleIn 0.6s ease-out;
-}
+.card:hover::before { width:4px; }
+.card:hover { transform:translateX(3px); box-shadow:0 8px 32px rgba(0,0,0,0.5); }
+.card.critical { background:rgba(8,2,14,0.9); }
+.card.critical::before { background:var(--kill); }
+.card.critical:hover { border-color:rgba(255,23,68,0.3); box-shadow:0 8px 32px rgba(255,23,68,0.1); }
+.card.tld-flag { background:rgba(10,8,2,0.9); }
+.card.tld-flag::before { background:var(--amber); }
+.card.tld-flag:hover { border-color:rgba(255,171,0,0.3); }
+.card.high::before { background:var(--azure-hi); }
+.card.high:hover { border-color:rgba(0,87,255,0.35); box-shadow:0 8px 32px rgba(0,87,255,0.1); }
+.card.medium::before { background:var(--amber); }
+.card.medium:hover { border-color:rgba(255,171,0,0.3); }
 
-/* ── BANNERS ─────────────────────────────────────────── */
-.appstore-banner, .ff-banner, .stale-banner, .roots-banner {
-  display:flex;
-  align-items:flex-start;
-  gap:12px;
-  border-radius:12px;
-  padding:12px 14px;
-  margin-bottom:12px;
-  border:1px solid rgba(0,102,255,0.15);
-  box-shadow:0 2px 8px rgba(0,0,0,0.2);
-  animation:fadeInUp 0.6s ease-out;
+/* card header */
+.card-head {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:13px 16px 0;
 }
-.appstore-banner { background:rgba(255,193,7,0.05); border-color:rgba(255,193,7,0.15); }
-.appstore-left { font-size:28px; flex-shrink:0; }
-.appstore-label { font-family:'Syne',sans-serif; font-size:9px; color:#ffc107; letter-spacing:1px; text-transform:uppercase; font-weight:700; }
-.appstore-time { font-family:'Syne',sans-serif; font-size:15px; font-weight:700; color:#ffd700; margin:3px 0; }
-.appstore-hint { font-size:9px; color:rgba(255,255,255,0.5); line-height:1.4; }
-
-.ff-banner { background:rgba(29,233,182,0.05); border-color:rgba(29,233,182,0.15); }
-.ff-left { font-size:28px; flex-shrink:0; }
-.ff-info { flex:1; }
-.ff-label { font-family:'Syne',sans-serif; font-size:9px; color:var(--success); letter-spacing:1px; text-transform:uppercase; font-weight:700; margin-bottom:6px; }
-.ff-session-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:5px 0; border-top:1px solid rgba(0,0,0,0.2); }
-.ff-session-row:first-of-type { border-top:none; }
-.ff-session-left { display:flex; flex-direction:column; gap:2px; }
-.ff-session-num { font-size:8px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; font-family:'Syne',sans-serif; font-weight:600; }
-.ff-session-ts { font-family:'Syne',sans-serif; font-size:14px; font-weight:700; color:#fff; }
-.ff-login-badge { font-size:8px; font-weight:700; padding:3px 9px; border-radius:10px; white-space:nowrap; flex-shrink:0; font-family:'Syne',sans-serif; }
-.ff-sessions { font-size:10px; color:#fff; margin-top:6px; font-weight:600; }
-.ff-hint { font-size:9px; color:rgba(255,255,255,0.6); margin-top:3px; line-height:1.4; }
-
-.stale-banner { background:rgba(255,179,0,0.05); border-color:rgba(255,179,0,0.15); }
-.stale-left { font-size:28px; flex-shrink:0; }
-.stale-label { font-family:'Syne',sans-serif; font-size:9px; color:var(--medium); letter-spacing:1px; text-transform:uppercase; font-weight:700; }
-.stale-time { font-family:'Syne',sans-serif; font-size:15px; color:#ffb300; margin:3px 0; font-weight:700; }
-.stale-time strong { color:#ffcc00; }
-.stale-hint { font-size:9px; color:rgba(255,255,255,0.5); line-height:1.4; }
-
-.roots-banner { background:rgba(255,82,82,0.05); border-color:rgba(255,82,82,0.15); }
-.roots-icon { font-size:28px; flex-shrink:0; }
-.roots-label { font-family:'Syne',sans-serif; font-size:9px; font-weight:700; color:var(--critical); letter-spacing:0.5px; margin-bottom:3px; }
-.roots-detail { font-family:'Syne',sans-serif; font-size:14px; color:#ff6666; font-weight:700; margin-bottom:4px; }
-.roots-hint { font-size:9px; color:rgba(255,255,255,0.5); line-height:1.4; }
-
-/* ── GHOST ───────────────────────────────────────────── */
-.ghost-banner {
-  background:rgba(0,0,139,0.06);
-  border:1px solid rgba(0,102,255,0.15);
-  border-radius:12px;
-  padding:14px;
-  margin-bottom:12px;
-  box-shadow:0 2px 8px rgba(0,0,0,0.2);
-  animation:fadeInUp 0.6s ease-out;
-}
-.ghost-header { display:flex; align-items:flex-start; gap:10px; margin-bottom:10px; }
-.ghost-icon { font-size:22px; flex-shrink:0; }
-.ghost-title-block { flex:1; }
-.ghost-title { font-family:'Syne',sans-serif; font-size:11px; font-weight:700; color:var(--blue-light); letter-spacing:0.5px; }
-.ghost-sub { font-size:8px; color:var(--text-dim); margin-top:2px; }
-.ghost-count { background:rgba(0,0,139,0.08); color:var(--blue-light); font-family:'Syne',sans-serif; font-size:11px; font-weight:700; padding:2px 10px; border-radius:10px; border:1px solid rgba(0,102,255,0.15); align-self:flex-start; }
-.ghost-rows { display:flex; flex-direction:column; gap:7px; margin-bottom:8px; }
-.ghost-row { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; background:rgba(0,0,139,0.04); border:1px solid rgba(0,102,255,0.1); border-radius:10px; padding:10px; transition:all 0.2s ease; animation:slideInLeft 0.5s ease-out; }
-.ghost-row:hover { background:rgba(0,0,139,0.08); border-color:var(--blue-accent); transform:translateX(2px); }
-.ghost-row-left { flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
-.ghost-row-right { display:flex; flex-direction:column; align-items:flex-end; gap:3px; flex-shrink:0; }
-.ghost-bundle { font-size:9px; font-weight:600; color:#c8d8e8; word-break:break-all; }
-.ghost-domains { display:flex; flex-wrap:wrap; gap:3px; }
-.ghost-domain { font-size:8px; background:rgba(0,0,139,0.08); color:var(--blue-light); border:1px solid rgba(0,102,255,0.1); padding:2px 6px; border-radius:7px; }
-.ghost-more { font-size:8px; color:var(--text-dim); }
-.ghost-hits { font-family:'Syne',sans-serif; font-size:11px; font-weight:700; color:var(--blue-light); }
-.ghost-label { font-size:8px; color:var(--text-dim); background:rgba(0,0,0,0.2); padding:2px 5px; border-radius:5px; border:1px solid rgba(0,0,139,0.1); }
-.ghost-hint { font-size:8px; color:var(--text-dim); border-top:1px solid rgba(0,0,139,0.1); padding-top:6px; margin-top:6px; }
-
-/* ── IPS ─────────────────────────────────────────────── */
-.ips-banner {
-  background:rgba(255,23,68,0.06);
-  border:1px solid rgba(255,23,68,0.15);
-  border-radius:12px;
-  padding:14px;
-  margin-bottom:12px;
-  box-shadow:0 2px 8px rgba(0,0,0,0.2);
-  animation:fadeInUp 0.6s ease-out 0.1s both;
-}
-.ips-header { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-.ips-icon { font-size:22px; flex-shrink:0; }
-.ips-header-text { flex:1; }
-.ips-title { font-family:'Syne',sans-serif; font-size:11px; font-weight:700; color:var(--critical); letter-spacing:0.5px; }
-.ips-sub { font-size:8px; color:var(--text-dim); margin-top:2px; }
-.ips-count { background:rgba(255,23,68,0.08); color:var(--critical); border:1px solid rgba(255,23,68,0.15); font-family:'Syne',sans-serif; font-size:11px; font-weight:700; padding:2px 10px; border-radius:10px; }
-.ips-rows { display:flex; flex-direction:column; gap:7px; margin-bottom:8px; }
-.ips-row { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; border-radius:10px; padding:10px; border:1px solid rgba(0,0,139,0.1); transition:all 0.2s ease; animation:slideInLeft 0.5s ease-out; }
-.ips-row:hover { border-color:var(--blue-accent); background:rgba(0,0,139,0.04); transform:translateX(2px); }
-.ips-row-critical { background:rgba(255,23,68,0.05); border-color:rgba(255,23,68,0.15); }
-.ips-row-vpn { background:rgba(0,0,139,0.06); border-color:rgba(0,102,255,0.15); }
-.ips-row-developer { background:rgba(29,233,182,0.05); border-color:rgba(29,233,182,0.15); }
-.ips-row-warning { background:rgba(255,179,0,0.05); border-color:rgba(255,179,0,0.15); }
-.ips-row-top { margin-bottom:3px; }
-.ips-cat-badge { display:inline-block; font-size:8px; font-weight:700; padding:2px 8px; border-radius:10px; letter-spacing:0.3px; font-family:'Syne',sans-serif; }
-.ips-cat-critical { background:rgba(255,23,68,0.1); color:var(--critical); border:1px solid rgba(255,23,68,0.15); }
-.ips-cat-vpn { background:rgba(0,102,255,0.1); color:var(--blue-light); border:1px solid rgba(0,102,255,0.15); }
-.ips-cat-developer { background:rgba(29,233,182,0.1); color:var(--success); border:1px solid rgba(29,233,182,0.15); }
-.ips-cat-warning { background:rgba(255,179,0,0.1); color:var(--medium); border:1px solid rgba(255,179,0,0.15); }
-.ips-row-left { display:flex; flex-direction:column; gap:2px; flex:1; min-width:0; }
-.ips-row-right { display:flex; flex-direction:column; align-items:flex-end; gap:3px; flex-shrink:0; }
-.ips-bundle { font-size:9px; font-weight:600; color:#c8d8e8; word-break:break-all; }
-.ips-reason { font-size:9px; color:#a0b8cc; line-height:1.4; }
-.ips-version { font-size:8px; color:var(--text-dim); }
-.ips-badge { font-size:8px; font-weight:700; padding:2px 7px; border-radius:10px; font-family:'Syne',sans-serif; }
-.ips-badge.launched { background:rgba(0,102,255,0.1); color:var(--blue-light); border:1px solid rgba(0,102,255,0.15); }
-.ips-badge.installed { background:rgba(29,233,182,0.1); color:var(--success); border:1px solid rgba(29,233,182,0.15); }
-.ips-hint { font-size:8px; color:var(--text-dim); line-height:1.4; }
-
-/* ── TEMPORAL ────────────────────────────────────────── */
-.section-mini-header {
-  font-family:'Syne',sans-serif;
-  font-size:11px;
-  font-weight:700;
-  letter-spacing:1px;
-  color:var(--text-dim);
+.badge {
+  font-family:var(--m); font-size:9px; letter-spacing:0.8px;
+  padding:4px 10px; border-radius:20px; border:1px solid;
   text-transform:uppercase;
-  margin-bottom:10px;
-  padding-bottom:6px;
-  border-bottom:1px solid rgba(0,102,255,0.1);
 }
-.temporal-section, .topapps-section {
-  background:rgba(0,0,139,0.06);
-  border:1px solid rgba(0,102,255,0.15);
-  border-radius:12px;
-  padding:14px;
-  margin-bottom:12px;
-  box-shadow:0 2px 8px rgba(0,0,0,0.2);
-  animation:scaleIn 0.5s ease-out;
-}
-.temporal-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:8px; }
-.temp-card { background:rgba(0,0,139,0.04); border:1px solid rgba(0,102,255,0.1); border-radius:10px; padding:8px 10px; transition:all 0.2s ease; }
-.temp-card:hover { background:rgba(0,0,139,0.08); border-color:var(--blue-accent); }
-.temp-card-warn { background:rgba(255,179,0,0.06) !important; border-color:rgba(255,179,0,0.15) !important; }
-.temp-label { font-size:8px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:3px; font-family:'Syne',sans-serif; font-weight:600; }
-.temp-val { font-family:'Syne',sans-serif; font-size:16px; font-weight:700; color:var(--blue-light); }
-.temp-spike { display:inline-block; font-size:8px; color:var(--medium); background:rgba(255,179,0,0.08); border:1px solid rgba(255,179,0,0.15); padding:2px 6px; border-radius:8px; font-weight:600; }
-.temporal-hint { font-size:9px; color:var(--text-dim); margin-top:6px; line-height:1.4; }
+.badge.critical { color:#ff4466; border-color:rgba(255,23,68,0.3); background:rgba(255,23,68,0.08); }
+.badge.tld-flag { color:var(--amber); border-color:rgba(255,171,0,0.3); background:rgba(255,171,0,0.07); }
+.badge.high     { color:var(--azure-hi); border-color:rgba(0,87,255,0.3); background:var(--azure-fog); }
+.badge.medium   { color:var(--amber); border-color:rgba(255,171,0,0.3); background:rgba(255,171,0,0.06); }
+.conns { font-family:var(--m); font-size:9px; color:var(--ink-dim); }
 
-/* ── TOP APPS ────────────────────────────────────────── */
-.topapp-rows { display:flex; flex-direction:column; gap:7px; }
-.topapp-row { display:flex; align-items:center; gap:10px; padding:8px 10px; background:rgba(0,0,139,0.04); border:1px solid rgba(0,102,255,0.1); border-radius:10px; transition:all 0.2s ease; animation:slideInLeft 0.5s ease-out; }
-.topapp-row:hover { background:rgba(0,0,139,0.08); border-color:var(--blue-accent); transform:translateX(2px); }
-.topapp-num { font-family:'Syne',sans-serif; font-size:12px; font-weight:700; width:24px; flex-shrink:0; }
-.topapp-info { flex:1; min-width:0; }
-.topapp-bid { font-size:8px; word-break:break-all; margin-bottom:2px; color:#c8d8e8; }
-.topapp-suspect { font-family:'Syne',sans-serif; font-size:8px; color:var(--critical); background:rgba(255,23,68,0.08); border:1px solid rgba(255,23,68,0.15); padding:2px 5px; border-radius:5px; font-weight:600; }
-.topapp-bar { height:3px; background:rgba(0,0,139,0.1); border-radius:2px; overflow:hidden; margin-bottom:2px; }
-.topapp-fill { height:100%; border-radius:2px; }
-.topapp-hits { font-family:'Syne',sans-serif; font-size:11px; font-weight:700; color:var(--text-dim); width:50px; text-align:right; flex-shrink:0; }
+/* card domain */
+.card-domain {
+  font-family:var(--m); font-size:12px; color:var(--ink);
+  padding:7px 16px 4px; word-break:break-all; font-weight:500;
+}
+
+/* card grid */
+.cgrid { padding:0 16px 14px; }
+.crow {
+  display:flex; gap:12px; padding:7px 0;
+  border-top:1px solid rgba(255,255,255,0.04); align-items:flex-start;
+}
+.clabel {
+  font-family:var(--m); font-size:9px; color:var(--ink-dim);
+  min-width:72px; flex-shrink:0; padding-top:1px;
+  letter-spacing:0.3px; line-height:1.5;
+}
+.cval { font-family:var(--m); font-size:10px; color:#b0c4de; flex:1; word-break:break-all; line-height:1.6; }
+.cval.isp { color:var(--amber); }
+.cval.reason { color:var(--kill); font-weight:500; }
+.cval.rdns { color:var(--plasma); font-style:italic; }
+.http-on { color:var(--ok); font-weight:600; }
+.http-off { color:var(--ink-dim); }
+.http-banner { color:var(--kill); text-transform:uppercase; font-size:9px; }
+
+.bundle-chip {
+  display:inline-block; background:var(--ink-ghost); border:1px solid var(--edge);
+  border-radius:var(--rad-xs); padding:2px 7px; font-size:8px; color:var(--ink-dim);
+  font-family:var(--m); margin:2px; word-break:break-all;
+}
+.domain-row { padding:3px 0; font-family:var(--m); font-size:10px; color:#b0c4de; word-break:break-all; }
+.dbadge { display:inline-block; font-size:8px; padding:2px 6px; border-radius:var(--rad-xs); margin-right:5px; vertical-align:middle; font-family:var(--m); }
+.dbadge.high   { background:rgba(0,87,255,0.1); color:var(--azure-hi); border:1px solid rgba(0,87,255,0.2); }
+.dbadge.medium { background:rgba(255,171,0,0.08); color:var(--amber); border:1px solid rgba(255,171,0,0.2); }
+
+.none { color:var(--ink-dim); font-style:italic; }
+.ok-panel {
+  background:var(--ok-fog); border:1px solid rgba(0,229,160,0.18);
+  border-radius:var(--rad-md); padding:20px; text-align:center;
+  font-family:var(--r); font-size:15px; font-weight:600; color:var(--ok);
+  animation:scaleUp 0.6s cubic-bezier(.22,1,.36,1) both;
+}
+.divider { height:1px; background:linear-gradient(90deg, transparent, var(--edge), transparent); margin:20px 0; }
+
+/* ═══════════════════════════════════════════════════════
+   TEMPORAL + TOP APPS
+═══════════════════════════════════════════════════════ */
+.panel {
+  background:var(--deep); border:1px solid var(--edge);
+  border-radius:var(--rad-lg); padding:16px;
+  margin-bottom:12px;
+  animation:fadeUp 0.5s cubic-bezier(.22,1,.36,1) both;
+}
+.panel-head {
+  display:flex; align-items:center; gap:8px; margin-bottom:14px;
+}
+.panel-title { font-family:var(--r); font-size:12px; font-weight:700; letter-spacing:0.5px; color:var(--ink); text-transform:uppercase; }
+.panel-dot { width:6px; height:6px; border-radius:50%; background:var(--azure-hi); flex-shrink:0; }
+
+.tgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.tcard {
+  background:var(--surface); border:1px solid var(--edge);
+  border-radius:var(--rad-md); padding:10px 12px;
+  transition:all 0.25s ease;
+}
+.tcard:hover { border-color:rgba(0,87,255,0.3); background:var(--panel); }
+.tcard-warn { background:rgba(255,171,0,0.04) !important; border-color:rgba(255,171,0,0.18) !important; }
+.tlabel { font-family:var(--m); font-size:8px; letter-spacing:1px; color:var(--ink-dim); text-transform:uppercase; margin-bottom:4px; }
+.tval { font-family:var(--b); font-size:22px; color:var(--azure-hi); }
+.tval.warn { color:var(--warn); }
+.tspike {
+  display:inline-flex; align-items:center; gap:5px;
+  background:rgba(255,171,0,0.07); border:1px solid rgba(255,171,0,0.2);
+  border-radius:20px; padding:4px 10px;
+  font-family:var(--m); font-size:8px; color:var(--amber);
+  margin-top:8px;
+}
+.tspike::before { content:'⚡'; }
+.thint { font-family:var(--i); font-size:9px; color:var(--ink-dim); margin-top:8px; line-height:1.5; padding-top:8px; border-top:1px solid rgba(255,255,255,0.05); }
+
+/* top apps */
+.tapp-list { display:flex; flex-direction:column; gap:6px; }
+.tapp-row {
+  display:flex; align-items:center; gap:10px;
+  padding:9px 11px; border-radius:var(--rad-sm);
+  background:var(--surface); border:1px solid var(--edge);
+  transition:all 0.25s ease; animation:slideR 0.4s cubic-bezier(.22,1,.36,1) both;
+}
+.tapp-row:hover { border-color:rgba(0,87,255,0.25); background:var(--panel); transform:translateX(2px); }
+.tapp-rank { font-family:var(--b); font-size:15px; width:26px; text-align:center; flex-shrink:0; }
+.tapp-info { flex:1; min-width:0; }
+.tapp-bid { font-family:var(--m); font-size:8px; color:var(--ink-mid); word-break:break-all; margin-bottom:3px; }
+.tapp-bar { height:2px; border-radius:1px; overflow:hidden; background:rgba(255,255,255,0.05); }
+.tapp-fill { height:100%; border-radius:1px; transition:width 0.8s cubic-bezier(.22,1,.36,1); }
+.tapp-suspect-tag {
+  font-family:var(--m); font-size:8px; color:var(--kill);
+  background:rgba(255,23,68,0.1); border:1px solid rgba(255,23,68,0.2);
+  padding:1px 6px; border-radius:var(--rad-xs); margin-left:4px;
+}
+.tapp-hits { font-family:var(--r); font-size:13px; font-weight:600; color:var(--ink-dim); flex-shrink:0; }
+
+/* ═══════════════════════════════════════════════════════
+   GHOST SECTION (legacy)
+═══════════════════════════════════════════════════════ */
+.ghost-panel {
+  background:var(--deep); border:1px solid var(--edge);
+  border-radius:var(--rad-lg); padding:16px; margin-bottom:12px;
+  animation:fadeUp 0.5s cubic-bezier(.22,1,.36,1) both;
+}
+.ghost-panel-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+.ghost-ptitle { font-family:var(--r); font-size:12px; font-weight:700; text-transform:uppercase; color:var(--azure-hi); flex:1; }
+.ghost-pc { font-family:var(--b); font-size:16px; color:var(--azure-hi); background:var(--azure-fog); border:1px solid rgba(0,87,255,0.2); border-radius:20px; padding:1px 10px; }
+.ghost-rows { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
+.ghost-row {
+  display:flex; justify-content:space-between; align-items:flex-start; gap:10px;
+  background:var(--surface); border:1px solid var(--edge);
+  border-radius:var(--rad-sm); padding:10px 12px;
+  transition:all 0.25s ease; animation:slideR 0.4s both;
+}
+.ghost-row:hover { border-color:rgba(0,87,255,0.25); transform:translateX(2px); }
+.ghost-bundle { font-family:var(--m); font-size:9px; color:var(--ink); margin-bottom:4px; word-break:break-all; }
+.ghost-domains { display:flex; flex-wrap:wrap; gap:3px; }
+.ghost-dom-chip { font-family:var(--m); font-size:8px; background:var(--azure-fog); color:var(--azure-hi); border:1px solid rgba(0,87,255,0.15); padding:2px 6px; border-radius:var(--rad-xs); }
+.ghost-more { font-family:var(--m); font-size:8px; color:var(--ink-dim); }
+.ghost-hits { font-family:var(--b); font-size:16px; color:var(--azure-hi); }
+.ghost-warn { font-family:var(--m); font-size:8px; color:var(--ink-dim); margin-top:2px; }
+.ghost-hint { font-family:var(--i); font-size:8px; color:var(--ink-dim); padding-top:8px; border-top:1px solid rgba(255,255,255,0.04); line-height:1.5; }
+
+/* ═══════════════════════════════════════════════════════
+   IPS SECTION
+═══════════════════════════════════════════════════════ */
+.ips-panel {
+  background:rgba(10,2,6,0.8); border:1px solid rgba(255,23,68,0.18);
+  border-radius:var(--rad-lg); padding:16px; margin-bottom:12px;
+  animation:fadeUp 0.5s cubic-bezier(.22,1,.36,1) both;
+}
+.ips-panel-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+.ips-ptitle { font-family:var(--r); font-size:12px; font-weight:700; text-transform:uppercase; color:var(--kill); flex:1; }
+.ips-pc { font-family:var(--b); font-size:16px; color:var(--kill); background:rgba(255,23,68,0.06); border:1px solid rgba(255,23,68,0.2); border-radius:20px; padding:1px 10px; }
+.ips-rows { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
+.ips-row {
+  display:flex; justify-content:space-between; align-items:flex-start; gap:10px;
+  border-radius:var(--rad-sm); padding:10px 12px; border:1px solid;
+  transition:all 0.25s ease; animation:slideR 0.4s both;
+}
+.ips-row:hover { transform:translateX(2px); }
+.ips-row-critical { background:rgba(255,23,68,0.04); border-color:rgba(255,23,68,0.18); }
+.ips-row-vpn      { background:var(--azure-fog); border-color:rgba(0,87,255,0.18); }
+.ips-row-developer { background:var(--ok-fog); border-color:rgba(0,229,160,0.15); }
+.ips-row-warning  { background:rgba(255,171,0,0.04); border-color:rgba(255,171,0,0.18); }
+.ips-cat {
+  display:inline-block; font-family:var(--m); font-size:8px; padding:2px 8px;
+  border-radius:20px; border:1px solid; margin-bottom:4px;
+}
+.ips-cat-critical  { color:var(--kill); border-color:rgba(255,23,68,0.25); background:rgba(255,23,68,0.06); }
+.ips-cat-vpn       { color:var(--azure-hi); border-color:rgba(0,87,255,0.25); background:var(--azure-fog); }
+.ips-cat-developer { color:var(--ok); border-color:rgba(0,229,160,0.25); background:var(--ok-fog); }
+.ips-cat-warning   { color:var(--amber); border-color:rgba(255,171,0,0.25); background:var(--amber-fog); }
+.ips-bid { font-family:var(--m); font-size:9px; color:var(--ink); word-break:break-all; margin-bottom:2px; }
+.ips-reason { font-family:var(--i); font-size:9px; color:var(--ink-mid); line-height:1.4; }
+.ips-ver { font-family:var(--m); font-size:8px; color:var(--ink-dim); }
+.ips-evt {
+  font-family:var(--m); font-size:8px; padding:2px 7px;
+  border-radius:var(--rad-xs); border:1px solid;
+}
+.ips-evt.launched { color:var(--azure-hi); border-color:rgba(0,87,255,0.2); background:var(--azure-fog); }
+.ips-evt.installed { color:var(--ok); border-color:rgba(0,229,160,0.2); background:var(--ok-fog); }
+.ips-hint { font-family:var(--i); font-size:8px; color:var(--ink-dim); line-height:1.5; }
+
+/* ═══════════════════════════════════════════════════════
+   ADVANCED MODULES (5 módulos)
+═══════════════════════════════════════════════════════ */
+.adv-divider {
+  display:flex; align-items:center; gap:12px; margin:28px 0 16px;
+  animation:fadeIn 0.6s both;
+}
+.adv-divider::before, .adv-divider::after { content:''; flex:1; height:1px; background:var(--edge); }
+.adv-divider-label {
+  font-family:var(--m); font-size:8px; letter-spacing:2.5px;
+  color:var(--azure-dim); text-transform:uppercase; white-space:nowrap;
+  padding:0 4px;
+}
+
+.adv-panel {
+  border-radius:var(--rad-lg); overflow:hidden; margin-bottom:10px;
+  border:1px solid var(--edge);
+  animation:fadeUp 0.5s cubic-bezier(.22,1,.36,1) both;
+}
+.adv-panel-head {
+  display:flex; align-items:center; gap:12px;
+  padding:14px 16px;
+  background:var(--surface); border-bottom:1px solid var(--edge);
+  position:relative; overflow:hidden;
+}
+.adv-panel-head::after {
+  content:''; position:absolute; bottom:0; left:0; right:0; height:1px;
+  background:linear-gradient(90deg, var(--azure-dim), transparent);
+  opacity:0.4;
+}
+.adv-panel-icon { font-size:20px; flex-shrink:0; }
+.adv-panel-text { flex:1; min-width:0; }
+.adv-panel-title { font-family:var(--r); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink); }
+.adv-panel-sub { font-family:var(--m); font-size:8px; color:var(--ink-dim); margin-top:2px; }
+.adv-panel-count {
+  font-family:var(--b); font-size:18px; flex-shrink:0;
+  padding:2px 12px; border-radius:20px; border:1px solid;
+}
+.adv-cnt-crit { color:var(--kill); border-color:rgba(255,23,68,0.25); background:rgba(255,23,68,0.06); }
+.adv-cnt-high { color:var(--azure-hi); border-color:rgba(0,87,255,0.25); background:var(--azure-fog); }
+.adv-body { background:var(--deep); }
+.adv-row {
+  padding:12px 16px; border-bottom:1px solid rgba(255,255,255,0.04);
+  transition:background 0.2s;
+}
+.adv-row:last-child { border-bottom:none; }
+.adv-row:hover { background:rgba(0,87,255,0.03); }
+.adv-row-top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+.adv-badge {
+  font-family:var(--m); font-size:8px; padding:3px 9px;
+  border-radius:20px; border:1px solid; flex-shrink:0;
+}
+.ab-crit { color:var(--kill); border-color:rgba(255,23,68,0.3); background:rgba(255,23,68,0.07); }
+.ab-high { color:var(--amber); border-color:rgba(255,109,0,0.3); background:rgba(255,109,0,0.06); }
+.ab-med  { color:var(--amber); border-color:rgba(255,171,0,0.25); background:rgba(255,171,0,0.05); }
+.adv-bundle { font-family:var(--m); font-size:8px; color:var(--ink-dim); flex:1; word-break:break-all; }
+.adv-delta { font-family:var(--m); font-size:9px; color:var(--ink-ghost); flex-shrink:0; }
+.adv-domain { font-family:var(--m); font-size:9px; color:var(--azure-hi); margin-bottom:4px; word-break:break-all; }
+.adv-meta { font-family:var(--i); font-size:8px; color:var(--ink-dim); line-height:1.6; }
+.adv-detail { font-family:var(--i); font-size:8px; color:var(--ink-mid); margin-top:3px; line-height:1.5; }
+.adv-detail.crit { color:var(--kill); font-weight:500; }
+.adv-foot { font-family:var(--i); font-size:8px; color:var(--ink-dim); padding:10px 16px; background:var(--surface); border-top:1px solid var(--edge); line-height:1.5; }
+
+/* scriptable highlight */
+.adv-row-scriptable { background:rgba(255,23,68,0.03); }
+.adv-row-scriptable:hover { background:rgba(255,23,68,0.06); }
+
+/* orphan block */
+.adv-orphan { padding:12px 16px; border-top:1px solid rgba(255,255,255,0.04); }
+.adv-orphan-title { font-family:var(--m); font-size:8px; letter-spacing:0.8px; color:var(--ink-dim); margin-bottom:8px; }
+.adv-orphan-chips { display:flex; flex-wrap:wrap; gap:4px; }
+.adv-oc { font-family:var(--m); font-size:8px; color:var(--ink-dim); background:var(--ink-ghost); border:1px solid var(--edge); padding:3px 8px; border-radius:var(--rad-xs); }
+.adv-oc.cheat { color:var(--kill); border-color:rgba(255,23,68,0.25); background:rgba(255,23,68,0.05); }
+
+/* ═══════════════════════════════════════════════════════
+   FOOTER
+═══════════════════════════════════════════════════════ */
+.report-foot {
+  text-align:center; padding:24px 20px 32px;
+  border-top:1px solid var(--edge);
+  font-family:var(--m); font-size:8px; color:var(--ink-dim); letter-spacing:0.5px;
+  position:relative;
+}
+.report-foot::before {
+  content:''; display:block; width:60px; height:1px; margin:0 auto 16px;
+  background:linear-gradient(90deg, transparent, var(--azure-dim), transparent);
+}
+.report-foot-brand { color:var(--azure-hi); margin-bottom:4px; font-size:10px; font-weight:500; }
 </style>
 </head>
 <body>
+<div class="scanline-wrap"><div class="scanline"></div></div>
+<div class="layout">
 
-<div class="hero">
-  <div class="hero-bg-stripes"></div>
+<!-- ══ HERO ══════════════════════════════════════════════════════ -->
+<header class="hero">
+  <div class="hero-noise"></div>
   <div class="hero-glow"></div>
-  <div class="hero-eyebrow">Anti-Cheat Scanner · iOS</div>
-  <div class="hero-name">PANTHER<span>SS</span></div>
-  <div class="hero-sub">Panther Apostas · Free Fire</div>
+  <div class="logo-wrap">
+    <div class="logo-eyebrow">Anti-Cheat Scanner · iOS Privacy Report</div>
+    <div class="logo-mark">
+      <span class="logo-panther">PANTHER</span><span class="logo-ss">SS</span>
+    </div>
+    <div class="logo-tagline">Panther Apostas · Free Fire · Segurança Mobile</div>
+    <div class="logo-bar"></div>
+  </div>
+
   <div class="lang-bar">
     <button class="lang-btn active" id="btn-pt">PT-BR</button>
     <button class="lang-btn" id="btn-en">EN</button>
     <button class="lang-btn" id="btn-es">ES</button>
   </div>
-  <div class="hero-file"><strong>Arquivo:</strong> ${filename}</div>
+
+  <div class="hero-file">
+    <span class="hero-file-dot"></span>
+    <span><strong>${filename}</strong></span>
+  </div>
+
   <div class="hero-grid">
-    <div class="hg-card"><div class="hg-label">Início</div><div class="hg-val">${fmtDt(firstTs)}</div></div>
-    <div class="hg-card"><div class="hg-label">Último registro</div><div class="hg-val">${fmtDt(lastTs)}</div></div>
-    <div class="hg-card"><div class="hg-label">Domínios únicos</div><div class="hg-val blue">${allDomains ? allDomains.length : 0}</div></div>
-    <div class="hg-card"><div class="hg-label">Total conexões</div><div class="hg-val">${netEntries.length}</div></div>
+    <div class="hg-card">
+      <div class="hg-label">Início</div>
+      <div class="hg-val">${fmtDt(firstTs)}</div>
+    </div>
+    <div class="hg-card">
+      <div class="hg-label">Último registro</div>
+      <div class="hg-val">${fmtDt(lastTs)}</div>
+    </div>
+    <div class="hg-card">
+      <div class="hg-label">Domínios únicos</div>
+      <div class="hg-val blue">${allDomains ? allDomains.length : 0}</div>
+    </div>
+    <div class="hg-card">
+      <div class="hg-label">Conexões totais</div>
+      <div class="hg-val blue">${netEntries.length}</div>
+    </div>
     ${ipsMeta && ipsMeta.iosVersion ? `<div class="hg-card${ipsMeta.rootsInstalled > 0 ? "" : " hg-card-full"}"><div class="hg-label">Versão iOS</div><div class="hg-val blue">${ipsMeta.iosVersion}</div></div>` : ""}
-    ${ipsMeta && ipsMeta.rootsInstalled > 0 ? `<div class="hg-card hg-card-warn"><div class="hg-label">⚠ Certificados raiz</div><div class="hg-val warn">${ipsMeta.rootsInstalled} instalado${ipsMeta.rootsInstalled>1?"s":""}</div></div>` : ""}
+    ${ipsMeta && ipsMeta.rootsInstalled > 0 ? `<div class="hg-card hg-card-warn"><div class="hg-label">⚠ Cert. raiz instalados</div><div class="hg-val warn">${ipsMeta.rootsInstalled}</div></div>` : ""}
   </div>
-</div>
+</header>
 
-<div class="verdict-bar">
-  <div class="verdict-emoji">${verdictEmoji}</div>
-  <div class="verdict-info">
+<!-- ══ VERDICT ════════════════════════════════════════════════════ -->
+<div class="verdict-strip">
+  <div class="verdict-icon">${verdictEmoji}</div>
+  <div class="verdict-body">
     <div class="verdict-label">Nível de risco</div>
-    <div class="verdict-text" style="color:${riskColor}">${riskLabel}</div>
+    <div class="verdict-value" style="color:${riskColor}">${riskLabel}</div>
   </div>
-  <div class="verdict-score-ring">
-    <svg width="54" height="54" viewBox="0 0 54 54">
-      <circle cx="27" cy="27" r="22" fill="none" stroke="rgba(30,144,255,0.08)" stroke-width="5"/>
-      <circle cx="27" cy="27" r="22" fill="none" stroke="${riskColor}" stroke-width="5"
-        stroke-dasharray="${Math.round(2*3.14159*22)}"
-        stroke-dashoffset="${Math.round(2*3.14159*22*(1-riskScore/100))}"
-        stroke-linecap="round"/>
+  <div class="verdict-ring">
+    <svg width="58" height="58" viewBox="0 0 58 58">
+      <circle cx="29" cy="29" r="23" fill="none" stroke="rgba(30,52,96,0.6)" stroke-width="5"/>
+      <circle cx="29" cy="29" r="23" fill="none" stroke="${riskColor}" stroke-width="5"
+        stroke-dasharray="${Math.round(2*3.14159*23)}"
+        stroke-dashoffset="${Math.round(2*3.14159*23*(1-riskScore/100))}"
+        stroke-linecap="round" style="transition:stroke-dashoffset 1.2s cubic-bezier(.22,1,.36,1)"/>
     </svg>
-    <div class="verdict-score-num" style="color:${riskColor}">${riskScore}</div>
+    <div class="verdict-ring-num" style="color:${riskColor}">${riskScore}</div>
   </div>
 </div>
 
-<div class="uptime-bar" style="${uptimeBg}">
-  <div class="uptime-dot" style="${uptimeDotCl}"></div>
+<!-- ══ UPTIME ════════════════════════════════════════════════════ -->
+<div class="uptime-rail">
+  <div class="uptime-beacon" style="${uptimeWarning ? "background:#ff4444;box-shadow:0 0 8px #ff4444" : "background:var(--azure-hi);box-shadow:0 0 8px var(--azure-hi)"}"></div>
   <div class="uptime-text">Monitorado há <strong>${uptimeStr}</strong></div>
-  ${uptimeWarnBadge}
+  ${uptimeWarning ? `<div class="uptime-pill">⚠ MENOS DE 20MIN</div>` : ""}
 </div>
 
-<div class="content">
+<!-- ══ CONTENT ═══════════════════════════════════════════════════ -->
+<main class="content">
+
+  <!-- alertas -->
   ${staleBanner}
   ${ffBanner}
   ${appStoreBanner}
 
-  <div class="summary">
-    <div class="stat"><div class="num" style="color:#ff1a4a">${criticalCount}</div><div class="lbl">Crítico</div></div>
-    <div class="stat"><div class="num" style="color:#ff4444">${highCount}</div><div class="lbl">Suspeito</div></div>
-    <div class="stat"><div class="num" style="color:#ffbb00">${medCount}</div><div class="lbl">Possível</div></div>
+  <!-- score stats -->
+  <div class="stat-row">
+    <div class="stat-card stat-c">
+      <div class="stat-num">${criticalCount}</div>
+      <div class="stat-lbl">Crítico</div>
+    </div>
+    <div class="stat-card stat-h">
+      <div class="stat-num">${highCount}</div>
+      <div class="stat-lbl">Suspeito</div>
+    </div>
+    <div class="stat-card stat-m">
+      <div class="stat-num">${medCount}</div>
+      <div class="stat-lbl">Possível</div>
+    </div>
   </div>
 
+  <!-- temporal + top apps -->
   ${temporalSection}
   ${topAppsSection}
 
+  <!-- ── CRÍTICOS ── -->
   ${criticalCount > 0 ? `
-  <div class="section-header sh-critical">
-    <div class="sh-icon">⚠</div>
-    <div class="sh-text"><div class="sh-title">Apps Proxy / Cheat Detectados</div><div class="sh-sub">Aplicativos e infraestrutura conhecida de cheats</div></div>
-    <div class="sh-count">${criticalCount}</div>
+  <div class="sec-head">
+    <div class="sec-icon sec-ic-crit">⚠</div>
+    <div class="sec-text">
+      <div class="sec-title sec-tc">Apps Proxy / Cheat Detectados</div>
+      <div class="sec-sub">Aplicativos e infraestrutura conhecida de cheats</div>
+    </div>
+    <div class="sec-count sec-cc">${criticalCount}</div>
   </div>
   ${criticalCards}
   <div class="divider"></div>` : ""}
 
+  <!-- ── ROOTS + IPS + GHOST ── -->
   ${highCount > 0 ? `
   ${rootsWarn}
   ${ipsSection}
   ${ghostSection}
-  <div class="section-header sh-high">
-    <div class="sh-icon">🚫</div>
-    <div class="sh-text"><div class="sh-title">IPs Suspeitos</div><div class="sh-sub">VPS / Hosting / Proxy confirmados</div></div>
-    <div class="sh-count">${highCount}</div>
+  <div class="sec-head">
+    <div class="sec-icon sec-ic-high">🚫</div>
+    <div class="sec-text">
+      <div class="sec-title sec-th">IPs Suspeitos</div>
+      <div class="sec-sub">VPS / Hosting / Proxy confirmados</div>
+    </div>
+    <div class="sec-count sec-ch">${highCount}</div>
   </div>` : `${ipsSection}${ghostSection}`}
 
   ${medCount > 0 && highCount === 0 ? `
-  <div class="section-header sh-medium">
-    <div class="sh-icon">⚠</div>
-    <div class="sh-text"><div class="sh-title">IPs Possíveis</div><div class="sh-sub">Infraestrutura cloud / datacenter</div></div>
-    <div class="sh-count">${medCount}</div>
+  <div class="sec-head">
+    <div class="sec-icon sec-ic-med">⚠</div>
+    <div class="sec-text">
+      <div class="sec-title sec-tm">IPs Possíveis</div>
+      <div class="sec-sub">Infraestrutura cloud / datacenter</div>
+    </div>
+    <div class="sec-count sec-cm">${medCount}</div>
   </div>` : ""}
 
   ${cards}
 
   ${findings.length > 0 && highCount > 0 && medCount > 0 ? `
   <div class="divider"></div>
-  <div class="section-header sh-medium">
-    <div class="sh-icon">⚠</div>
-    <div class="sh-text"><div class="sh-title">IPs Possíveis</div><div class="sh-sub">Infraestrutura cloud / datacenter</div></div>
-    <div class="sh-count">${medCount}</div>
+  <div class="sec-head">
+    <div class="sec-icon sec-ic-med">⚠</div>
+    <div class="sec-text">
+      <div class="sec-title sec-tm">IPs Possíveis</div>
+      <div class="sec-sub">Infraestrutura cloud / datacenter</div>
+    </div>
+    <div class="sec-count sec-cm">${medCount}</div>
   </div>` : ""}
 
-</div>
+  <!-- ── MÓDULOS AVANÇADOS ── -->
+  ${(ipVsLocSection || shortcutSection || sideloadSection || scriptSection || ghostActivitySection) ? `
+  <div class="adv-divider"><span class="adv-divider-label">🔬 análise avançada · 5 módulos</span></div>
+  ${ipVsLocSection}
+  ${shortcutSection}
+  ${sideloadSection}
+  ${scriptSection}
+  ${ghostActivitySection}
+  ` : ""}
+
+</main>
+
+<!-- ══ FOOTER ════════════════════════════════════════════════════ -->
+<footer class="report-foot">
+  <div class="report-foot-brand">PANTHERSS · ANTI-CHEAT · iOS</div>
+  Relatório gerado automaticamente — Panther Apostas<br>
+  Arquivo: ${filename}
+</footer>
+
+</div><!-- /layout -->
 
 <script>
 (function(){
-var TRANSLATIONS={pt:{criticalLabel:"Crítico",suspectLabel:"Suspeito",possibleLabel:"Possível",monitoredFor:"Monitorado há",appProxyTitle:"Apps Proxy / Cheat Detectados",appProxySub:"Aplicativos e infraestrutura conhecida de cheats",suspectIPsTitle:"IPs Suspeitos",suspectIPsSub:"VPS / Hosting / Proxy confirmados",possibleIPsTitle:"IPs Possíveis",possibleIPsSub:"Infraestrutura cloud / datacenter",noVPS:"✓ Nenhum IP VPS / Hosting / Proxy detectado.",badgeSuspect:"SUSPEITO",badgePossible:"POSSÍVEL",badgeDomainSuspect:"⚠ DOMÍNIO SUSPEITO",badgeCritical:"⚠ CRÍTICO — APP PROXY/CHEAT",badgeKnownCheat:"⚠ CRÍTICO — CHEAT CONFIRMADO",conns:"conexões",online:"● Online",offline:"● Offline / Sem resposta",staleLabel:"Arquivo possivelmente antigo",staleHint:"Suspeita: arquivo gerado fora do período da partida para esconder atividade.",ffLabel:"Sessões no período",ffSessions:"inicializações registradas no período",ffHint:"Se a última abertura foi após a partida → aplique o W.O!",appStoreLabel:"App Store aberta",appStoreHint:"Se foi após a partida → aplique o W.O!",uptimeLess20:"MENOS DE 20MIN — Relatório pode não cobrir a partida inteira!",riskLevel:"Nível de risco"},en:{criticalLabel:"Critical",suspectLabel:"Suspicious",possibleLabel:"Possible",monitoredFor:"Monitored for",appProxyTitle:"Proxy / Cheat Apps Detected",appProxySub:"Known cheat applications and infrastructure",suspectIPsTitle:"Suspicious IPs",suspectIPsSub:"VPS / Hosting / Confirmed Proxy",possibleIPsTitle:"Possible IPs",possibleIPsSub:"Cloud / datacenter infrastructure",noVPS:"✓ No VPS / Hosting / Proxy IPs detected.",badgeSuspect:"SUSPICIOUS",badgePossible:"POSSIBLE",badgeDomainSuspect:"⚠ SUSPICIOUS DOMAIN",badgeCritical:"⚠ CRITICAL — PROXY/CHEAT APP",badgeKnownCheat:"⚠ CRITICAL — CONFIRMED CHEAT",conns:"connections",online:"● Online",offline:"● Offline / No response",staleLabel:"File possibly outdated",staleHint:"Suspicion: file generated outside the match period to hide activity.",ffLabel:"Sessions in period",ffSessions:"startups recorded in the period",ffHint:"If last opened after the match → apply W.O!",appStoreLabel:"App Store opened",appStoreHint:"If it was after the match → apply W.O!",uptimeLess20:"LESS THAN 20MIN — Report may not cover the entire match!",riskLevel:"Risk level"},es:{criticalLabel:"Crítico",suspectLabel:"Sospechoso",possibleLabel:"Posible",monitoredFor:"Monitoreado hace",appProxyTitle:"Apps Proxy / Cheat Detectadas",appProxySub:"Aplicaciones y cheats conocidas",suspectIPsTitle:"IPs Sospechosas",suspectIPsSub:"VPS / Hosting / Proxy confirmados",possibleIPsTitle:"IPs Posibles",possibleIPsSub:"Infraestructura cloud / datacenter",noVPS:"✓ Ninguna IP VPS / Hosting / Proxy detectada.",badgeSuspect:"SOSPECHOSO",badgePossible:"POSIBLE",badgeDomainSuspect:"⚠ DOMINIO SOSPECHOSO",badgeCritical:"⚠ CRÍTICO — APP PROXY/CHEAT",badgeKnownCheat:"⚠ CRÍTICO — CHEAT CONFIRMADO",conns:"conexiones",online:"● En línea",offline:"● Sin conexión / Sin respuesta",staleLabel:"Archivo posiblemente antiguo",staleHint:"Sospecha: archivo generado fuera del período del partido para ocultar actividad.",ffLabel:"Sesiones en el período",ffSessions:"inicializaciones registradas en el período",ffHint:"Si la última apertura fue después del partido → ¡aplica el W.O!",appStoreLabel:"App Store abierta",appStoreHint:"Si fue después del partido → ¡aplica el W.O!",uptimeLess20:"MENOS DE 20MIN — ¡El informe puede no cubrir toda la partida!",riskLevel:"Nivel de riesgo"}};
-function q(sel){return Array.from(document.querySelectorAll(sel))}
+/* ── TRANSLATIONS ── */
+var T={pt:{criticalLabel:"Crítico",suspectLabel:"Suspeito",possibleLabel:"Possível",monitoredFor:"Monitorado há",appProxyTitle:"Apps Proxy / Cheat Detectados",appProxySub:"Aplicativos e infraestrutura conhecida de cheats",suspectIPsTitle:"IPs Suspeitos",suspectIPsSub:"VPS / Hosting / Proxy confirmados",possibleIPsTitle:"IPs Possíveis",possibleIPsSub:"Infraestrutura cloud / datacenter",noVPS:"✓ Nenhum IP VPS / Hosting / Proxy detectado.",badgeSuspect:"SUSPEITO",badgePossible:"POSSÍVEL",badgeDomainSuspect:"⚠ DOMÍNIO SUSPEITO",badgeCritical:"⚠ CRÍTICO — APP PROXY/CHEAT",badgeKnownCheat:"⚠ CRÍTICO — CHEAT CONFIRMADO",conns:"conexões",online:"● Online",offline:"● Offline / Sem resposta",staleLabel:"Arquivo possivelmente antigo",staleHint:"Suspeita: arquivo gerado fora do período da partida para esconder atividade.",ffLabel:"Sessões no período",ffSessions:"inicializações registradas no período",ffHint:"Se a última abertura foi após a partida → aplique o W.O!",appStoreLabel:"App Store aberta",appStoreHint:"Se foi após a partida → aplique o W.O!",uptimeLess20:"MENOS DE 20MIN — Relatório pode não cobrir a partida inteira!",riskLevel:"Nível de risco"},en:{criticalLabel:"Critical",suspectLabel:"Suspicious",possibleLabel:"Possible",monitoredFor:"Monitored for",appProxyTitle:"Proxy / Cheat Apps Detected",appProxySub:"Known cheat applications and infrastructure",suspectIPsTitle:"Suspicious IPs",suspectIPsSub:"VPS / Hosting / Confirmed Proxy",possibleIPsTitle:"Possible IPs",possibleIPsSub:"Cloud / datacenter infrastructure",noVPS:"✓ No VPS / Hosting / Proxy IPs detected.",badgeSuspect:"SUSPICIOUS",badgePossible:"POSSIBLE",badgeDomainSuspect:"⚠ SUSPICIOUS DOMAIN",badgeCritical:"⚠ CRITICAL — PROXY/CHEAT APP",badgeKnownCheat:"⚠ CRITICAL — CONFIRMED CHEAT",conns:"connections",online:"● Online",offline:"● Offline / No response",staleLabel:"File possibly outdated",staleHint:"Suspicion: file generated outside the match period to hide activity.",ffLabel:"Sessions in period",ffSessions:"startups recorded in the period",ffHint:"If last opened after the match → apply W.O!",appStoreLabel:"App Store opened",appStoreHint:"If it was after the match → apply W.O!",uptimeLess20:"LESS THAN 20MIN — Report may not cover the entire match!",riskLevel:"Risk level"},es:{criticalLabel:"Crítico",suspectLabel:"Sospechoso",possibleLabel:"Posible",monitoredFor:"Monitoreado hace",appProxyTitle:"Apps Proxy / Cheat Detectadas",appProxySub:"Aplicaciones y cheats conocidas",suspectIPsTitle:"IPs Sospechosas",suspectIPsSub:"VPS / Hosting / Proxy confirmados",possibleIPsTitle:"IPs Posibles",possibleIPsSub:"Infraestructura cloud / datacenter",noVPS:"✓ Ninguna IP VPS / Hosting / Proxy detectada.",badgeSuspect:"SOSPECHOSO",badgePossible:"POSIBLE",badgeDomainSuspect:"⚠ DOMINIO SOSPECHOSO",badgeCritical:"⚠ CRÍTICO — APP PROXY/CHEAT",badgeKnownCheat:"⚠ CRÍTICO — CHEAT CONFIRMADO",conns:"conexiones",online:"● En línea",offline:"● Sin conexión / Sin respuesta",staleLabel:"Archivo posiblemente antiguo",staleHint:"Sospecha: archivo generado fuera del período del partido para ocultar actividad.",ffLabel:"Sesiones en el período",ffSessions:"inicializaciones registradas en el período",ffHint:"Si la última apertura fue después del partido → ¡aplica el W.O!",appStoreLabel:"App Store abierta",appStoreHint:"Si fue después del partido → ¡aplica el W.O!",uptimeLess20:"MENOS DE 20MIN — ¡El informe puede no cubrir toda la partida!",riskLevel:"Nivel de riesgo"}};
+function q(s){return Array.from(document.querySelectorAll(s))}
 function setLang(lang){
-  var t=TRANSLATIONS[lang];if(!t)return;
+  var t=T[lang];if(!t)return;
   ['pt','en','es'].forEach(function(l){var b=document.getElementById('btn-'+l);if(b)b.classList.toggle('active',l===lang)});
-  q('.stat .lbl').forEach(function(el,i){var k=['criticalLabel','suspectLabel','possibleLabel'][i];if(k&&t[k])el.textContent=t[k]});
+  q('.stat-lbl').forEach(function(el,i){var k=['criticalLabel','suspectLabel','possibleLabel'][i];if(k&&t[k])el.textContent=t[k]});
   q('.uptime-text').forEach(function(el){var s=el.querySelector('strong');if(s){var v=s.textContent;el.innerHTML=t.monitoredFor+' <strong>'+v+'</strong>'}});
-  q('.uptime-warn-badge').forEach(function(el){el.textContent='⚠ '+t.uptimeLess20});
-  q('.ok').forEach(function(el){el.textContent=t.noVPS});
+  q('.uptime-pill').forEach(function(el){el.textContent='⚠ '+t.uptimeLess20});
+  q('.ok-panel').forEach(function(el){el.textContent=t.noVPS});
   q('.stale-label').forEach(function(el){el.textContent=t.staleLabel});
   q('.stale-hint').forEach(function(el){el.textContent=t.staleHint});
   q('.ff-label').forEach(function(el){var v=el.textContent.indexOf('MAX')!==-1?'Free Fire MAX':'Free Fire';el.textContent=v+' — '+t.ffLabel});
-  q('.ff-sessions').forEach(function(el){var n=el.textContent.match(/\d+/);if(n)el.textContent=n[0]+' '+t.ffSessions});
+  q('.ff-count-label').forEach(function(el){var n=el.textContent.match(/\d+/);if(n)el.textContent=n[0]+' '+t.ffSessions});
   q('.ff-hint').forEach(function(el){el.textContent=t.ffHint});
-  q('.appstore-label').forEach(function(el){el.textContent=t.appStoreLabel});
-  q('.appstore-hint').forEach(function(el){el.textContent=t.appStoreHint});
+  q('.alert-store .alert-label').forEach(function(el){el.textContent=t.appStoreLabel});
+  q('.alert-store .alert-hint').forEach(function(el){el.textContent=t.appStoreHint});
   q('.verdict-label').forEach(function(el){el.textContent=t.riskLevel});
-  q('.section-header').forEach(function(sh){var tt=sh.querySelector('.sh-title'),sb=sh.querySelector('.sh-sub');if(!tt)return;if(sh.classList.contains('sh-critical')){tt.textContent=t.appProxyTitle;if(sb)sb.textContent=t.appProxySub}else if(sh.classList.contains('sh-high')){tt.textContent=t.suspectIPsTitle;if(sb)sb.textContent=t.suspectIPsSub}else if(sh.classList.contains('sh-medium')){tt.textContent=t.possibleIPsTitle;if(sb)sb.textContent=t.possibleIPsSub}});
+  q('.sec-head').forEach(function(sh){
+    var tt=sh.querySelector('.sec-title'),sb=sh.querySelector('.sec-sub');if(!tt)return;
+    if(tt.classList.contains('sec-tc')){tt.textContent=t.appProxyTitle;if(sb)sb.textContent=t.appProxySub}
+    else if(tt.classList.contains('sec-th')){tt.textContent=t.suspectIPsTitle;if(sb)sb.textContent=t.suspectIPsSub}
+    else if(tt.classList.contains('sec-tm')){tt.textContent=t.possibleIPsTitle;if(sb)sb.textContent=t.possibleIPsSub}
+  });
   q('.card').forEach(function(card){
     var badge=card.querySelector('.badge');var connsEl=card.querySelector('.conns');
     if(connsEl){var n=connsEl.textContent.match(/\d+/);if(n)connsEl.textContent=n[0]+' '+t.conns}
     if(badge){if(badge.classList.contains('critical'))badge.innerHTML=badge.getAttribute('data-badge-type')==='known-cheat'?t.badgeKnownCheat:t.badgeCritical;else if(badge.classList.contains('tld-flag'))badge.innerHTML=t.badgeDomainSuspect;else if(badge.classList.contains('high'))badge.textContent=t.badgeSuspect;else if(badge.classList.contains('medium'))badge.textContent=t.badgePossible}
-    q('.val').forEach(function(el){if(el.textContent.indexOf('Online')!==-1||el.textContent.indexOf('Offline')!==-1||el.textContent.indexOf('línea')!==-1){el.innerHTML=el.innerHTML.replace(/●\s*(En línea|Online)/g,t.online).replace(/●\s*(Sin conexión[^<]*|Offline[^<]*)/g,t.offline)}});
+    q('.cval').forEach(function(el){if(el.textContent.indexOf('Online')!==-1||el.textContent.indexOf('Offline')!==-1||el.textContent.indexOf('línea')!==-1){el.innerHTML=el.innerHTML.replace(/●\s*(En línea|Online)/g,t.online).replace(/●\s*(Sin conexión[^<]*|Offline[^<]*)/g,t.offline)}});
   });
 }
 window.setLang=setLang;
-function bindBtns(){['pt','en','es'].forEach(function(l){var b=document.getElementById('btn-'+l);if(b)b.addEventListener('click',function(e){e.preventDefault();setLang(l)})})}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bindBtns);else bindBtns();
+/* ── STAGGER ANIMATIONS ── */
+document.addEventListener('DOMContentLoaded',function(){
+  var cards=document.querySelectorAll('.card,.adv-row,.tapp-row,.ghost-row,.ips-row');
+  cards.forEach(function(el,i){el.style.animationDelay=(i*40)+'ms';});
+  /* bar widths */
+  document.querySelectorAll('.tapp-fill').forEach(function(el){
+    var w=el.getAttribute('data-w')||el.style.width;
+    el.style.width='0';
+    setTimeout(function(){el.style.width=w;},300);
+  });
+  function bindBtns(){['pt','en','es'].forEach(function(l){var b=document.getElementById('btn-'+l);if(b)b.addEventListener('click',function(e){e.preventDefault();setLang(l)});})}
+  bindBtns();
+});
 })();
 </script>
 </body>
 </html>`
+}
 }
 
 // ─── FILE READING ────────────────────────────────────────────────────────────
@@ -1832,9 +2747,9 @@ async function main() {
   let filename = (ndjsonPath || "arquivo").split("/").pop()
   Speech.speak(S.start)
 
-  let { findings, netEntries, cheatAppFindings, knownCheatFindings, ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains } = await analyze(entries)
+  let { findings, netEntries, cheatAppFindings, knownCheatFindings, ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains, ipVsLocationFindings, shortcutFindings, sideloadFindings, scriptURLFindings, ghostActivityResult } = await analyze(entries, [])
 
-  let html = buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, ipsFindings, ipsMeta, ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains, filename)
+  let html = buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, ipsFindings, ipsMeta, ghostAppFindings, proxyLoginFindings, temporalAnalysis, topApps, allDomains, filename, { ipVsLocationFindings, shortcutFindings, sideloadFindings, scriptURLFindings, ghostActivityResult })
   await showResult(html)
 }
 
