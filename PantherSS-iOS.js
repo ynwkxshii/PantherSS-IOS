@@ -1278,7 +1278,7 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
       <div class="cgrid">
         <div class="crow"><span class="clabel">Cheat</span><span class="cval reason">${k.desc}</span></div>
         <div class="crow"><span class="clabel">Indicador</span><span class="cval">${k.indicator.includes(".")&&!k.indicator.match(/^\d+/)?"Domínio":"IP"} detectado no relatório de rede</span></div>
-        ${bundleList?`<div class="crow"><span class="clabel">Usado por</span><span class="cval">${bundleList}</span></div>`:""}
+        `+(bundleList?'<div class="crow"><span class="clabel">Usado por</span><span class="cval">'+bundleList+'</span></div>':"")+`
       </div></div>`
   }
   for (let f of cheatAppFindings) {
@@ -1411,7 +1411,7 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
       return `<div class="tapp-row">
         <div class="tapp-rank" style="color:${color}">#${i+1}</div>
         <div class="tapp-info">
-          <div class="tapp-bid" style="color:${isSuspect?"#ff6666":"#8899bb"}">${bid}${isSuspect?`<span class="tapp-suspect-tag">⚠ SUSPEITO</span>`:""}</div>
+          <div class="tapp-bid" style="color:${isSuspect?"#ff6666":"#8899bb"}">${bid}`+(isSuspect?'<span class="tapp-suspect-tag">⚠ SUSPEITO</span>':"")+`</div>
           <div class="tapp-bar"><div class="tapp-fill" data-w="${pct}%" style="width:${pct}%;background:${color}66"></div></div>
         </div>
         <div class="tapp-hits">${hits.toLocaleString()}</div>
@@ -1438,13 +1438,9 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
           <div class="tlabel">Média conexões/min</div>
           <div class="tval">${temporalAnalysis.avgPerMinute}</div>
         </div>
-        ${hasSpikes ? `<div class="tcard tcard-warn" style="grid-column:1/-1">
-          <div class="tlabel">Picos anômalos detectados</div>
-          <div class="tval warn">${temporalAnalysis.spikes}</div>
-        </div>` : ""}
+        `+(hasSpikes ? '<div class="tcard tcard-warn" style="grid-column:1/-1"><div class="tlabel">Picos anômalos detectados</div><div class="tval warn">'+temporalAnalysis.spikes+'</div></div>' : "")+`
       </div>
-      ${hasSpikes ? `<div class="tspike">${temporalAnalysis.spikes} pico${temporalAnalysis.spikes>1?"s":""} anômalo${temporalAnalysis.spikes>1?"s":""} — uso atípico detectado</div>
-      <div class="thint">Picos de tráfego ${temporalAnalysis.spikes>1?"indicam":"indica"} uso intenso atípico — possível cheat ativo durante sessão de jogo</div>` : ""}
+      `+(hasSpikes ? '<div class="tspike">'+temporalAnalysis.spikes+' pico'+(temporalAnalysis.spikes>1?"s":"")+' anômalo'+(temporalAnalysis.spikes>1?"s":"")+' — uso atípico detectado</div><div class="thint">Picos de tráfego '+(temporalAnalysis.spikes>1?"indicam":"indica")+' uso intenso atípico — possível cheat ativo durante sessão de jogo</div>' : "")+`
     </div>`
   }
 
@@ -1570,9 +1566,7 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
         </div>
         <div class="adv-domain">${f.domain}</div>
         <div class="adv-meta">🔖 ${f.pattern}</div>
-        ${f.isScriptable
-          ? `<div class="adv-detail crit">dk.simonbs.Scriptable executa JavaScript arbitrário baixado dessa URL — vetor confirmado de cheat via script remoto</div>`
-          : ""}
+        `+(f.isScriptable ? '<div class="adv-detail crit">dk.simonbs.Scriptable executa JavaScript arbitrário baixado dessa URL — vetor confirmado de cheat via script remoto</div>' : "")+`
       </div>`
     }).join("")
     scriptSection = `<div class="adv-panel">
@@ -1617,9 +1611,7 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
     let orphanBlock = orphans.length > 0
       ? `<div class="adv-orphan">
           <div class="adv-orphan-title">⬛ Apps instalados sem rastro no relatório — ${orphans.length} encontrados</div>
-          <div class="adv-orphan-chips">${orphans.map(o =>
-            `<span class="adv-oc ${o.isKnownCheat ? "cheat" : ""}">${o.bundleID}${o.isKnownCheat ? " ⚠" : ""}</span>`
-          ).join("")}</div>
+          <div class="adv-orphan-chips">`+orphans.map(function(o){return '<span class="adv-oc '+(o.isKnownCheat?"cheat":"")+'">'+o.bundleID+(o.isKnownCheat?" ⚠":"")+'</span>';}).join("")+`</div>
         </div>` : ""
     ghostActivitySection = `<div class="adv-panel">
       <div class="adv-panel-head">
@@ -1630,7 +1622,7 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
         </div>
         <span class="adv-panel-count adv-cnt-high">${ghosts.length}</span>
       </div>
-      ${ghosts.length > 0 ? `<div class="adv-body">${ghostRows}</div>` : ""}
+      `+(ghosts.length > 0 ? '<div class="adv-body">'+ghostRows+'</div>' : "")+`
       ${orphanBlock}
       <div class="adv-foot">⚠ Apps "fantasma" operam no dispositivo sem aparecer visivelmente — padrão de cheats injetados via TrollStore ou tweak de jailbreak</div>
     </div>`
@@ -1653,8 +1645,8 @@ function buildHTML(findings, netEntries, cheatAppFindings, knownCheatFindings, i
           <div class="crow"><span class="clabel">País</span><span class="cval">${f.country} / ${f.city}</span></div>
           <div class="crow"><span class="clabel">Provedor</span><span class="cval isp">${f.isp}</span></div>
           <div class="crow"><span class="clabel">Org</span><span class="cval">${f.org}</span></div>
-          ${f.reverse?`<div class="crow"><span class="clabel">rDNS</span><span class="cval rdns">${f.reverse}</span></div>`:""}
-          ${f.probe?`<div class="crow"><span class="clabel">HTTP</span><span class="cval">${f.probe.online?`<span class="http-on">● Online</span>${f.probe.status?` — HTTP ${f.probe.status}`:""}${f.probe.banner?` — <span class="http-banner">${f.probe.banner}</span>`:""}` :`<span class="http-off">● Offline / Sem resposta</span>`}</span></div>`:""}
+          `+(f.reverse?'<div class="crow"><span class="clabel">rDNS</span><span class="cval rdns">'+f.reverse+'</span></div>':"")+`
+          `+(f.probe?'<div class="crow"><span class="clabel">HTTP</span><span class="cval">'+(f.probe.online?'<span class="http-on">● Online</span>'+(f.probe.status?' — HTTP '+f.probe.status:""  )+(f.probe.banner?' — <span class="http-banner">'+f.probe.banner+'</span>':""):'<span class="http-off">● Offline / Sem resposta</span>')+'</span></div>':"")+`
           <div class="crow"><span class="clabel">Motivo</span><span class="cval reason" data-reasons='${JSON.stringify(f.reasons)}'>${f.reasons.join("<br>")}</span></div>
           <div class="crow"><span class="clabel">Usado por</span><span class="cval">${bundleList}</span></div>
         </div></div>`
@@ -2435,8 +2427,8 @@ body::after {
       <div class="hg-label">Conexões totais</div>
       <div class="hg-val blue">${netEntries.length}</div>
     </div>
-    ${ipsMeta && ipsMeta.iosVersion ? `<div class="hg-card${ipsMeta.rootsInstalled > 0 ? "" : " hg-card-full"}"><div class="hg-label">Versão iOS</div><div class="hg-val blue">${ipsMeta.iosVersion}</div></div>` : ""}
-    ${ipsMeta && ipsMeta.rootsInstalled > 0 ? `<div class="hg-card hg-card-warn"><div class="hg-label">⚠ Cert. raiz instalados</div><div class="hg-val warn">${ipsMeta.rootsInstalled}</div></div>` : ""}
+    `+(ipsMeta && ipsMeta.iosVersion ? '<div class="hg-card'+(ipsMeta.rootsInstalled > 0 ? "" : " hg-card-full")+'"><div class="hg-label">Versão iOS</div><div class="hg-val blue">'+ipsMeta.iosVersion+'</div></div>' : "")+`
+    `+(ipsMeta && ipsMeta.rootsInstalled > 0 ? '<div class="hg-card hg-card-warn"><div class="hg-label">⚠ Cert. raiz instalados</div><div class="hg-val warn">'+ipsMeta.rootsInstalled+'</div></div>' : "")+`
   </div>
 </header>
 
@@ -2463,7 +2455,7 @@ body::after {
 <div class="uptime-rail">
   <div class="uptime-beacon" style="${uptimeWarning ? "background:#ff4444;box-shadow:0 0 8px #ff4444" : "background:var(--azure-hi);box-shadow:0 0 8px var(--azure-hi)"}"></div>
   <div class="uptime-text">Monitorado há <strong>${uptimeStr}</strong></div>
-  ${uptimeWarning ? `<div class="uptime-pill">⚠ MENOS DE 20MIN</div>` : ""}
+  `+(uptimeWarning ? '<div class="uptime-pill">⚠ MENOS DE 20MIN</div>' : "")+`
 </div>
 
 <!-- ══ CONTENT ═══════════════════════════════════════════════════ -->
@@ -2495,64 +2487,19 @@ body::after {
   ${topAppsSection}
 
   <!-- ── CRÍTICOS ── -->
-  ${criticalCount > 0 ? `
-  <div class="sec-head">
-    <div class="sec-icon sec-ic-crit">⚠</div>
-    <div class="sec-text">
-      <div class="sec-title sec-tc">Apps Proxy / Cheat Detectados</div>
-      <div class="sec-sub">Aplicativos e infraestrutura conhecida de cheats</div>
-    </div>
-    <div class="sec-count sec-cc">${criticalCount}</div>
-  </div>
-  ${criticalCards}
-  <div class="divider"></div>` : ""}
+  `+(criticalCount > 0 ? '<div class="sec-head"><div class="sec-icon sec-ic-crit">⚠</div><div class="sec-text"><div class="sec-title sec-tc">Apps Proxy / Cheat Detectados</div><div class="sec-sub">Aplicativos e infraestrutura conhecida de cheats</div></div><div class="sec-count sec-cc">'+criticalCount+'</div></div>'+criticalCards+'<div class="divider"></div>' : "")+`
 
   <!-- ── ROOTS + IPS + GHOST ── -->
-  ${highCount > 0 ? `
-  ${rootsWarn}
-  ${ipsSection}
-  ${ghostSection}
-  <div class="sec-head">
-    <div class="sec-icon sec-ic-high">🚫</div>
-    <div class="sec-text">
-      <div class="sec-title sec-th">IPs Suspeitos</div>
-      <div class="sec-sub">VPS / Hosting / Proxy confirmados</div>
-    </div>
-    <div class="sec-count sec-ch">${highCount}</div>
-  </div>` : `${ipsSection}${ghostSection}`}
+  `+(highCount > 0 ? rootsWarn+ipsSection+ghostSection+'<div class="sec-head"><div class="sec-icon sec-ic-high">🚫</div><div class="sec-text"><div class="sec-title sec-th">IPs Suspeitos</div><div class="sec-sub">VPS / Hosting / Proxy confirmados</div></div><div class="sec-count sec-ch">'+highCount+'</div></div>' : ipsSection+ghostSection)+`
 
-  ${medCount > 0 && highCount === 0 ? `
-  <div class="sec-head">
-    <div class="sec-icon sec-ic-med">⚠</div>
-    <div class="sec-text">
-      <div class="sec-title sec-tm">IPs Possíveis</div>
-      <div class="sec-sub">Infraestrutura cloud / datacenter</div>
-    </div>
-    <div class="sec-count sec-cm">${medCount}</div>
-  </div>` : ""}
+  `+(medCount > 0 && highCount === 0 ? '<div class="sec-head"><div class="sec-icon sec-ic-med">⚠</div><div class="sec-text"><div class="sec-title sec-tm">IPs Possíveis</div><div class="sec-sub">Infraestrutura cloud / datacenter</div></div><div class="sec-count sec-cm">'+medCount+'</div></div>' : "")+`
 
   ${cards}
 
-  ${findings.length > 0 && highCount > 0 && medCount > 0 ? `
-  <div class="divider"></div>
-  <div class="sec-head">
-    <div class="sec-icon sec-ic-med">⚠</div>
-    <div class="sec-text">
-      <div class="sec-title sec-tm">IPs Possíveis</div>
-      <div class="sec-sub">Infraestrutura cloud / datacenter</div>
-    </div>
-    <div class="sec-count sec-cm">${medCount}</div>
-  </div>` : ""}
+  `+(findings.length > 0 && highCount > 0 && medCount > 0 ? '<div class="divider"></div><div class="sec-head"><div class="sec-icon sec-ic-med">⚠</div><div class="sec-text"><div class="sec-title sec-tm">IPs Possíveis</div><div class="sec-sub">Infraestrutura cloud / datacenter</div></div><div class="sec-count sec-cm">'+medCount+'</div></div>' : "")+`
 
   <!-- ── MÓDULOS AVANÇADOS ── -->
-  ${(ipVsLocSection || shortcutSection || sideloadSection || scriptSection || ghostActivitySection) ? `
-  <div class="adv-divider"><span class="adv-divider-label">🔬 análise avançada · 5 módulos</span></div>
-  ${ipVsLocSection}
-  ${shortcutSection}
-  ${sideloadSection}
-  ${scriptSection}
-  ${ghostActivitySection}
-  ` : ""}
+  `+((ipVsLocSection || shortcutSection || sideloadSection || scriptSection || ghostActivitySection) ? '<div class="adv-divider"><span class="adv-divider-label">🔬 análise avançada · 5 módulos</span></div>'+ipVsLocSection+shortcutSection+sideloadSection+scriptSection+ghostActivitySection : "")+`
 
 </main>
 
