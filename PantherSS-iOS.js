@@ -1556,4 +1556,4 @@ async function main() {
   await showResult(html)
 }
 
-await main()
+main()
